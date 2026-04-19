@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <string.h>
-#include <freertos/freeRTOS.h>
+#include <freertos/FreeRTOS.h>
 #include <esp_log.h>
 #include "user_app.h"
 #include "sdcard_bsp.h"
