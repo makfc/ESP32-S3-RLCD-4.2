@@ -8,6 +8,7 @@
 static lv_disp_draw_buf_t disp_buf; 		// contains internal graphic buffer(s) called draw buffer(s)
 static lv_disp_drv_t disp_drv;      		// contains callback functions
 static SemaphoreHandle_t lvgl_mux = NULL;
+static TaskHandle_t lvgl_task_handle = NULL;
 
 static const char *TAG = "LvglPort";
 
@@ -28,6 +29,13 @@ void Lvgl_unlock(void)
   	xSemaphoreGive(lvgl_mux);
 }
 
+void Lvgl_request_refresh(void)
+{
+    if (lvgl_task_handle != NULL) {
+        xTaskNotifyGive(lvgl_task_handle);
+    }
+}
+
 static void Lvgl_port_task(void *arg)
 {
   	uint32_t task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
@@ -46,7 +54,7 @@ static void Lvgl_port_task(void *arg)
   	  	{
   	  	  	task_delay_ms = LVGL_TASK_MIN_DELAY_MS;
   	  	}
-  	  	vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
+  	  	(void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(task_delay_ms));
   	}
 }
 
@@ -66,7 +74,8 @@ void Lvgl_PortInit(int width, int height,DispFlushCb flush_cb) {
   	disp_drv.hor_res = width;
   	disp_drv.ver_res = height;
   	disp_drv.flush_cb = flush_cb;
-	disp_drv.full_refresh = 1;
+	// Keep partial refresh enabled to reduce redraw latency for small clock updates.
+	disp_drv.full_refresh = 0;
   	disp_drv.draw_buf = &disp_buf;
   	lv_disp_drv_register(&disp_drv);
 
@@ -78,5 +87,5 @@ void Lvgl_PortInit(int width, int height,DispFlushCb flush_cb) {
   	ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
   	ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer,LVGL_TICK_PERIOD_MS * 1000));
 
-    xTaskCreatePinnedToCore(Lvgl_port_task, "LVGL", 8 * 1024, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(Lvgl_port_task, "LVGL", 8 * 1024, NULL, 5, &lvgl_task_handle, 0);
 }

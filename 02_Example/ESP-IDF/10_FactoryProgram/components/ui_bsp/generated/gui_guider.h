@@ -47,6 +47,7 @@ typedef struct
 	lv_obj_t *screen_label_17;
 	lv_obj_t *screen_label_16;
 	lv_obj_t *screen_label_15;
+	lv_obj_t *screen_news_label;   /* news ticker — bottom bar, overlays all screens */
 }lv_ui;
 
 typedef void (*ui_setup_scr_t)(lv_ui * ui);
@@ -83,6 +84,10 @@ LV_FONT_DECLARE(lv_font_MISANSMEDIUM_100)
 LV_FONT_DECLARE(lv_font_MISANSMEDIUM_20)
 LV_FONT_DECLARE(lv_font_MISANSMEDIUM_25)
 LV_FONT_DECLARE(lv_font_MISANSMEDIUM_18)
+/* Date-only Traditional Chinese font (50px). */
+LV_FONT_DECLARE(lv_font_notosans_tc_50)
+/* News ticker Traditional Chinese font (16px). */
+LV_FONT_DECLARE(lv_font_news_tc_16)
 
 
 #ifdef __cplusplus

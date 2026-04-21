@@ -1,0 +1,7 @@
+.DS_Store
+.lock
+.claude
+*.lock
+build/
+managed_components/
+/02_Example/ESP-IDF/10_FactoryProgram/.cache

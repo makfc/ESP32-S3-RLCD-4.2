@@ -3,15 +3,18 @@ idf_component_register(
     "lvgl_bsp.cpp"
     "ble_scan_bsp.c"
     "esp_wifi_bsp.c"
+    "news_service.c"
     PRIV_REQUIRES
     esp_wifi
     esp_event
     nvs_flash
     ui_bsp
-    espressif__avi_player 
+    espressif__avi_player
     espressif__esp_new_jpeg
     port_bsp
     esp_timer
+    esp_http_client
+    mbedtls
     REQUIRES
     bt
     lvgl__lvgl

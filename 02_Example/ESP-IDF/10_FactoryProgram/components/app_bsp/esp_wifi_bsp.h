@@ -21,6 +21,13 @@ extern "C" {
 void espwifi_init(void);
 void espwifi_deinit(void);
 
+/* Block until STA gets an IP (bit 0x04) or timeout. Returns true if connected. */
+bool espwifi_wait_ip(uint32_t timeout_ms);
+
+/* Sync system time from NTP and wait for first confirmed sync.
+ * SNTP remains running for periodic re-sync. */
+bool espwifi_sync_time(const char *server, uint32_t timeout_ms);
+
 
 #ifdef __cplusplus
 }
