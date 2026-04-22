@@ -22,6 +22,23 @@ static int   s_buf_len = 0;
 static int   s_buf_cap = 0;
 static bool  s_buf_truncated = false;
 
+static void log_heap_state(const char *stage)
+{
+    const size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const size_t spi_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t spi_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(
+        TAG,
+        "heap %s: internal free=%u largest=%u, spiram free=%u largest=%u",
+        (stage != NULL) ? stage : "unknown",
+        (unsigned int)int_free,
+        (unsigned int)int_largest,
+        (unsigned int)spi_free,
+        (unsigned int)spi_largest
+    );
+}
+
 static void clear_titles(void)
 {
     if (s_titles != NULL) {
@@ -202,6 +219,7 @@ static void parse_rss(void)
 
 void news_service_fetch(void)
 {
+    log_heap_state("before_fetch");
     clear_titles();
     s_buf_len = 0;
     s_buf_cap = 0;
@@ -221,20 +239,35 @@ void news_service_fetch(void)
         .buffer_size_tx   = 1024,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "esp_http_client_init failed");
+        heap_caps_free(s_buf);
+        s_buf = NULL;
+        s_buf_cap = 0;
+        return;
+    }
     /* Request uncompressed response so we can parse it directly */
     esp_http_client_set_header(client, "Accept-Encoding", "identity");
+    ESP_LOGI(TAG, "HTTP start: %s", RSS_URL);
 
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
         const int http_status = esp_http_client_get_status_code(client);
         s_buf[s_buf_len] = '\0';
         ESP_LOGI(TAG, "HTTP ok status=%d bytes=%d cap=%d", http_status, s_buf_len, s_buf_cap);
+        if (http_status != 200) {
+            ESP_LOGW(TAG, "Unexpected HTTP status=%d (feed may be redirected/blocked)", http_status);
+        }
         parse_rss();
+        if (s_count == 0) {
+            ESP_LOGW(TAG, "RSS parse completed but no <item><title> found");
+        }
         if (s_buf_truncated) {
             ESP_LOGW(TAG, "HTTP body truncated at %d bytes (cap=%d)", s_buf_len, s_buf_cap);
         }
     } else {
         ESP_LOGE(TAG, "HTTP error: %s", esp_err_to_name(err));
+        log_heap_state("http_error");
     }
 
     esp_http_client_cleanup(client);
@@ -242,6 +275,7 @@ void news_service_fetch(void)
     s_buf = NULL;
     s_buf_cap = 0;
 
+    log_heap_state("after_fetch");
     ESP_LOGI(TAG, "fetched %u headline(s)", (unsigned int)s_count);
 }
 

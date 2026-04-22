@@ -4,6 +4,7 @@ idf_component_register(
     "ble_scan_bsp.c"
     "esp_wifi_bsp.c"
     "news_service.c"
+    "weather_service.c"
     PRIV_REQUIRES
     esp_wifi
     esp_event
@@ -15,6 +16,7 @@ idf_component_register(
     esp_timer
     esp_http_client
     mbedtls
+    json
     REQUIRES
     bt
     lvgl__lvgl

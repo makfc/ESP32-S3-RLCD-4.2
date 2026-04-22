@@ -72,7 +72,7 @@ void espwifi_init(void)
     esp_wifi_init(&cfg);                                 // Initialize WiFi
     esp_event_handler_instance_t Instance_WIFI_IP;
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &Instance_WIFI_IP);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &Instance_WIFI_IP);
+    esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &Instance_WIFI_IP);
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = "PDCN",
@@ -81,37 +81,55 @@ void espwifi_init(void)
     };
     esp_wifi_set_mode(WIFI_MODE_STA);               // Set mode to STA
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config); // Configure WiFi
+    xEventGroupClearBits(wifi_even_, 0x07);
     esp_wifi_start();                               // Start WiFi
     xTaskCreatePinnedToCore(example_scan_wifi_task, "example_scan_wifi_task", 3000, NULL, 2, NULL,0);   
 }
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
-    if (event_id == WIFI_EVENT_STA_START)
-    {
-        xEventGroupSetBits(wifi_even_,0x01);
-    }
-    else if (event_id == IP_EVENT_STA_GOT_IP)
-    {
+    if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_START)) {
+        ESP_LOGI(TAG, "WIFI_EVENT_STA_START");
+        xEventGroupSetBits(wifi_even_, 0x01);
+    } else if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP)) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         char ip[25];
         uint32_t pxip = event->ip_info.ip.addr;
         sprintf(ip, "%d.%d.%d.%d", (uint8_t)(pxip), (uint8_t)(pxip >> 8), (uint8_t)(pxip >> 16), (uint8_t)(pxip >> 24));
         strncpy(user_esp_bsp._ip, ip, sizeof(user_esp_bsp._ip) - 1);
-        ESP_LOGI("wifiSta", "IP: %s", ip);
+        ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP: %s", ip);
         xEventGroupSetBits(wifi_even_, 0x04);   /* signal: has IP */
-    }
-    else if(event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-        ESP_LOGD("wifiSta","Disconnected");
+    } else if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_LOST_IP)) {
+        ESP_LOGW(TAG, "IP_EVENT_STA_LOST_IP");
+        xEventGroupClearBits(wifi_even_, 0x04);
+    } else if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_DISCONNECTED)) {
+        ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED");
+        xEventGroupClearBits(wifi_even_, 0x04);
     }
 }
 
 bool espwifi_wait_ip(uint32_t timeout_ms)
 {
-    EventBits_t bits = xEventGroupWaitBits(wifi_even_, 0x04, pdFALSE, pdTRUE,
-                                           pdMS_TO_TICKS(timeout_ms));
-    return (bits & 0x04) != 0;
+    if (wifi_even_ == NULL) {
+        ESP_LOGW(TAG, "wait_ip called before wifi init");
+        return false;
+    }
+    const int64_t start_us = esp_timer_get_time();
+    EventBits_t bits = xEventGroupWaitBits(wifi_even_, 0x04, pdFALSE, pdTRUE, pdMS_TO_TICKS(timeout_ms));
+    const uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+    const bool ok = (bits & 0x04) != 0;
+    if (ok) {
+        ESP_LOGI(
+            TAG,
+            "wait_ip OK after %lu ms bits=0x%02x ip=%s",
+            (unsigned long)elapsed_ms,
+            (unsigned int)bits,
+            (user_esp_bsp._ip[0] != '\0') ? user_esp_bsp._ip : "unknown"
+        );
+    } else {
+        ESP_LOGW(TAG, "wait_ip timeout after %lu ms bits=0x%02x", (unsigned long)elapsed_ms, (unsigned int)bits);
+    }
+    return ok;
 }
 
 bool espwifi_sync_time(const char *server, uint32_t timeout_ms)

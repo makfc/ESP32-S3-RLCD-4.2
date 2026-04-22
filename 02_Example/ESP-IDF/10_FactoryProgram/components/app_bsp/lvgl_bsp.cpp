@@ -11,6 +11,7 @@ static SemaphoreHandle_t lvgl_mux = NULL;
 static TaskHandle_t lvgl_task_handle = NULL;
 
 static const char *TAG = "LvglPort";
+static const int64_t LVGL_HANDLER_WARN_MS = 80;
 
 static void Increase_lvgl_tick(void *arg)
 {
@@ -43,7 +44,12 @@ static void Lvgl_port_task(void *arg)
   	{
   	  	if (Lvgl_lock(-1)) 
   	  	{
+            const int64_t handler_start_us = esp_timer_get_time();
   	  	  	task_delay_ms = lv_timer_handler();
+            const int64_t handler_dur_ms = (esp_timer_get_time() - handler_start_us) / 1000;
+            if (handler_dur_ms >= LVGL_HANDLER_WARN_MS) {
+                ESP_LOGW(TAG, "lv_timer_handler blocked %lld ms", (long long)handler_dur_ms);
+            }
   	  	  	//Release the mutex
   	  	  	Lvgl_unlock();
   	  	}
