@@ -201,8 +201,15 @@ void espwifi_deinit(void)
     }
     esp_wifi_stop();
     esp_wifi_deinit();
-    esp_netif_destroy_default_wifi(net);
+    if (net != NULL) {
+        esp_netif_destroy_default_wifi(net);
+        net = NULL;
+    }
     esp_event_loop_delete_default();
+    if (wifi_even_ != NULL) {
+        vEventGroupDelete(wifi_even_);
+        wifi_even_ = NULL;
+    }
     //esp_netif_deinit();
     //nvs_flash_deinit();
 }

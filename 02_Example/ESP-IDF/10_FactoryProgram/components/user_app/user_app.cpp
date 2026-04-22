@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <sys/time.h>
+#include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <esp_log.h>
 #include "button_bsp.h"
@@ -24,6 +25,7 @@ I2cMasterBus I2cbus(14,13,0);
 static volatile bool s_news_show  = false;
 static volatile bool s_news_dirty = false;
 static char          s_news_buf[NEWS_TITLE_LEN];
+static volatile uint32_t s_news_post_seq = 0;
 CustomSDPort *sdcardPort = NULL;
 Shtc3Port *shtc3port = NULL;
 EventGroupHandle_t CodecGroups;
@@ -34,6 +36,181 @@ static lv_obj_t *s_clock_char_labels[8] = {0};
 static const char *TAG = "user_app";
 static const int32_t CLOCK_PIPELINE_COMP_US = 150000; // compensate LCD flush latency (~100ms+)
 static const uint32_t CLOCK_POLL_MS = 20;
+static const uint32_t NEWS_ITEM_INTERVAL_MS = 10000;
+static const uint32_t NEWS_REFRESH_INTERVAL_MS = 30UL * 60UL * 1000UL;
+static const uint32_t NEWS_RETRY_INTERVAL_MS = 60UL * 1000UL;
+static const int NEWS_BAR_X = 0;
+static const int NEWS_BAR_Y = 236;
+static const int NEWS_BAR_W = 400;
+static const int NEWS_BAR_H = 64;
+static const uint32_t NEWS_ANIM_MS = 2000;
+static lv_obj_t *s_news_anim_box = NULL;
+static lv_obj_t *s_news_label_cur = NULL;
+static lv_obj_t *s_news_label_next = NULL;
+static bool s_news_anim_running = false;
+static bool s_news_anim_initialized = false;
+static char s_news_pending_text[NEWS_TITLE_LEN] = {0};
+static bool s_news_pending_valid = false;
+
+static void NewsBarApplyTextAnimated(const char *text);
+
+static void PostNewsText(const char *text, const char *reason, size_t idx, size_t cnt)
+{
+    if (text == NULL) {
+        text = "";
+    }
+    strlcpy(s_news_buf, text, sizeof(s_news_buf));
+    s_news_post_seq++;
+    s_news_dirty = true;
+    ESP_LOGI(
+        TAG,
+        "NEWS post #%lu reason=%s idx=%u cnt=%u text=\"%.64s\"",
+        (unsigned long)s_news_post_seq,
+        (reason != NULL) ? reason : "unknown",
+        (unsigned int)idx,
+        (unsigned int)cnt,
+        s_news_buf
+    );
+}
+
+static void NewsLabelSetY(void *var, int32_t y)
+{
+    if (var != NULL) {
+        lv_obj_set_y((lv_obj_t *)var, y);
+    }
+}
+
+static void NewsAnimReadyCb(lv_anim_t *a)
+{
+    (void)a;
+    lv_obj_t *tmp = s_news_label_cur;
+    s_news_label_cur = s_news_label_next;
+    s_news_label_next = tmp;
+
+    if (s_news_label_cur != NULL) {
+        lv_obj_set_y(s_news_label_cur, 0);
+    }
+    if (s_news_label_next != NULL) {
+        lv_obj_set_y(s_news_label_next, NEWS_BAR_H);
+        lv_label_set_text(s_news_label_next, "");
+    }
+
+    s_news_anim_running = false;
+
+    if (s_news_pending_valid) {
+        char pending_text[NEWS_TITLE_LEN] = {0};
+        strlcpy(pending_text, s_news_pending_text, sizeof(pending_text));
+        s_news_pending_valid = false;
+        NewsBarApplyTextAnimated(pending_text);
+    }
+}
+
+static void NewsBarApplyTextAnimated(const char *text)
+{
+    if (text == NULL) {
+        text = "";
+    }
+
+    if (s_news_label_cur == NULL || s_news_label_next == NULL) {
+        lv_label_set_text(init_ui.screen_news_label, text);
+        return;
+    }
+
+    if (!s_news_anim_initialized) {
+        lv_label_set_text(s_news_label_cur, text);
+        lv_obj_set_y(s_news_label_cur, 0);
+        lv_obj_set_y(s_news_label_next, NEWS_BAR_H);
+        s_news_anim_initialized = true;
+        return;
+    }
+
+    const char *current_text = lv_label_get_text(s_news_label_cur);
+    if (current_text != NULL && strcmp(current_text, text) == 0) {
+        return;
+    }
+
+    if (s_news_anim_running) {
+        strlcpy(s_news_pending_text, text, sizeof(s_news_pending_text));
+        s_news_pending_valid = true;
+        return;
+    }
+
+    lv_label_set_text(s_news_label_next, text);
+    lv_obj_set_y(s_news_label_next, NEWS_BAR_H);
+    s_news_anim_running = true;
+
+    lv_anim_t anim_out;
+    lv_anim_init(&anim_out);
+    lv_anim_set_var(&anim_out, s_news_label_cur);
+    lv_anim_set_exec_cb(&anim_out, NewsLabelSetY);
+    lv_anim_set_values(&anim_out, 0, -NEWS_BAR_H);
+    lv_anim_set_time(&anim_out, NEWS_ANIM_MS);
+    lv_anim_set_path_cb(&anim_out, lv_anim_path_ease_out);
+    lv_anim_start(&anim_out);
+
+    lv_anim_t anim_in;
+    lv_anim_init(&anim_in);
+    lv_anim_set_var(&anim_in, s_news_label_next);
+    lv_anim_set_exec_cb(&anim_in, NewsLabelSetY);
+    lv_anim_set_values(&anim_in, NEWS_BAR_H, 0);
+    lv_anim_set_time(&anim_in, NEWS_ANIM_MS);
+    lv_anim_set_path_cb(&anim_in, lv_anim_path_ease_out);
+    lv_anim_set_ready_cb(&anim_in, NewsAnimReadyCb);
+    lv_anim_start(&anim_in);
+}
+
+static void SetupNewsTickerAnimated(const lv_font_t *news_font)
+{
+    lv_obj_t *parent = lv_obj_get_parent(init_ui.screen_news_label);
+    if (parent == NULL) {
+        return;
+    }
+
+    lv_obj_add_flag(init_ui.screen_news_label, LV_OBJ_FLAG_HIDDEN);
+
+    s_news_anim_box = lv_obj_create(parent);
+    lv_obj_set_pos(s_news_anim_box, NEWS_BAR_X, NEWS_BAR_Y);
+    lv_obj_set_size(s_news_anim_box, NEWS_BAR_W, NEWS_BAR_H);
+    lv_obj_add_flag(s_news_anim_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_news_anim_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(s_news_anim_box, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_bg_opa(s_news_anim_box, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_news_anim_box, lv_color_hex(0x1a3a5c), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_shadow_width(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_left(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_right(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_clip_corner(s_news_anim_box, true, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_move_foreground(s_news_anim_box);
+
+    s_news_label_cur = lv_label_create(s_news_anim_box);
+    s_news_label_next = lv_label_create(s_news_anim_box);
+
+    lv_obj_t *labels[2] = {s_news_label_cur, s_news_label_next};
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *label = labels[i];
+        lv_label_set_text(label, "");
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_size(label, NEWS_BAR_W, NEWS_BAR_H);
+        lv_obj_set_pos(label, 0, (i == 0) ? 0 : NEWS_BAR_H);
+        lv_obj_set_style_border_width(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_radius(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(label, news_font, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_opa(label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_letter_space(label, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_left(label, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_right(label, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_top(label, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_bottom(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_width(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+}
 
 static bool FontHasGlyph(const lv_font_t *font, uint32_t codepoint)
 {
@@ -179,7 +356,15 @@ void Lvgl_UserTask(void *arg) {
             localtime_r(&tv_now.tv_sec, &raw_tm);
 
             const bool pre_advance = (tv_now.tv_usec >= (1000000 - CLOCK_PIPELINE_COMP_US));
-            const time_t display_epoch = tv_now.tv_sec + (pre_advance ? 1 : 0);
+            const time_t target_epoch = tv_now.tv_sec + (pre_advance ? 1 : 0);
+
+            time_t display_epoch = target_epoch;
+            bool forced_catch_up = false;
+            if (last_display_epoch != (time_t)-1 && target_epoch > (last_display_epoch + 1)) {
+                // Prevent visible 02 -> 04 jumps; catch up one second at a time.
+                display_epoch = last_display_epoch + 1;
+                forced_catch_up = true;
+            }
 
             if (display_epoch != last_display_epoch) {
                 last_display_epoch = display_epoch;
@@ -198,28 +383,24 @@ void Lvgl_UserTask(void *arg) {
                          weekday_zh[display_tm.tm_wday]);
                 lv_label_set_text(init_ui.screen_label_4, lvgl_buffer);
                 Lvgl_request_refresh();
-                ESP_LOGI(
-                    TAG,
-                    "CLK draw raw=%02d:%02d:%02d.%03ld ui=%02d:%02d:%02d pre=%d",
-                    raw_tm.tm_hour,
-                    raw_tm.tm_min,
-                    raw_tm.tm_sec,
-                    (long)(tv_now.tv_usec / 1000),
-                    display_tm.tm_hour,
-                    display_tm.tm_min,
-                    display_tm.tm_sec,
-                    pre_advance ? 1 : 0
-                );
+                (void)raw_tm;
+                (void)target_epoch;
+                (void)forced_catch_up;
             }
         }
 
         if (s_news_show) {
             s_news_show = false;
-            lv_obj_clear_flag(init_ui.screen_news_label, LV_OBJ_FLAG_HIDDEN);
+            if (s_news_anim_box != NULL) {
+                lv_obj_clear_flag(s_news_anim_box, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_clear_flag(init_ui.screen_news_label, LV_OBJ_FLAG_HIDDEN);
+            }
         }
         if (s_news_dirty) {
             s_news_dirty = false;
-            lv_label_set_text(init_ui.screen_news_label, s_news_buf);
+            NewsBarApplyTextAnimated(s_news_buf);
+            ESP_LOGI(TAG, "NEWS apply #%lu text=\"%.64s\"", (unsigned long)s_news_post_seq, s_news_buf);
         }
 
         if ((int32_t)(now_tick - next_shtc3_tick) >= 0)
@@ -391,10 +572,31 @@ void Codec_LoopTask(void *arg) {
 }
 
 void News_TickerTask(void *arg) {
+    const TickType_t refresh_ticks = pdMS_TO_TICKS(NEWS_REFRESH_INTERVAL_MS);
+    const TickType_t retry_ticks = pdMS_TO_TICKS(NEWS_RETRY_INTERVAL_MS);
+    const TickType_t rotate_ticks = pdMS_TO_TICKS(NEWS_ITEM_INTERVAL_MS);
+    TickType_t rotate_wake_tick = xTaskGetTickCount();
+
+    auto periodic_fetch_news = []() -> bool {
+        ESP_LOGI(TAG, "News periodic refresh: start");
+        espwifi_init();
+
+        bool ok = false;
+        if (espwifi_wait_ip(20000)) {
+            news_service_fetch();
+            ok = news_service_count() > 0;
+            ESP_LOGI(TAG, "News periodic refresh: got %u item(s)", (unsigned int)news_service_count());
+        } else {
+            ESP_LOGW(TAG, "News periodic refresh: no IP");
+        }
+
+        espwifi_deinit();
+        ESP_LOGI(TAG, "News periodic refresh: done (%s)", ok ? "OK" : "FAIL");
+        return ok;
+    };
+
     /* Signal Lvgl_UserTask to show bar with loading message */
-    strncpy(s_news_buf, "正在連接網絡，抓取新聞中...", sizeof(s_news_buf) - 1);
-    s_news_buf[sizeof(s_news_buf) - 1] = '\0';
-    s_news_dirty = true;
+    PostNewsText("正在連接網絡，抓取新聞中...", "boot_wait", 0, 0);
     s_news_show  = true;
 
     /* Wait up to 60 s for news_service_fetch() to complete */
@@ -404,26 +606,45 @@ void News_TickerTask(void *arg) {
         waited++;
     }
 
-    if (news_service_count() == 0) {
-        strncpy(s_news_buf, "無法取得新聞（請檢查 Wi-Fi 設定）", sizeof(s_news_buf) - 1);
-        s_news_buf[sizeof(s_news_buf) - 1] = '\0';
-        s_news_dirty = true;
-        vTaskDelete(NULL);
-        return;
-    }
-
     char buf[NEWS_TITLE_LEN];
-    uint8_t idx = 0;
+    size_t idx = 0;
+    TickType_t next_refresh_tick = xTaskGetTickCount() + ((news_service_count() > 0) ? refresh_ticks : 0);
+
     for (;;) {
-        uint8_t cnt = news_service_count();
-        if (idx >= cnt) idx = 0;
-        if (news_service_get(idx, buf, sizeof(buf))) {
-            strncpy(s_news_buf, buf, sizeof(s_news_buf) - 1);
-            s_news_buf[sizeof(s_news_buf) - 1] = '\0';
-            s_news_dirty = true;
+        TickType_t now_tick = xTaskGetTickCount();
+        if ((int32_t)(now_tick - next_refresh_tick) >= 0) {
+            PostNewsText("新聞更新中...", "refresh_start", idx, news_service_count());
+
+            const bool refreshed = periodic_fetch_news();
+            const size_t new_cnt = news_service_count();
+            if (idx >= new_cnt) {
+                idx = 0;
+            }
+            now_tick = xTaskGetTickCount();
+            next_refresh_tick = now_tick + (refreshed ? refresh_ticks : retry_ticks);
+            rotate_wake_tick = now_tick;
+            ESP_LOGI(
+                TAG,
+                "NEWS refresh done refreshed=%d new_cnt=%u next_in_ms=%lu",
+                refreshed ? 1 : 0,
+                (unsigned int)new_cnt,
+                (unsigned long)(refreshed ? NEWS_REFRESH_INTERVAL_MS : NEWS_RETRY_INTERVAL_MS)
+            );
         }
-        idx++;
-        vTaskDelay(pdMS_TO_TICKS(10000));
+
+        const size_t cnt = news_service_count();
+        ESP_LOGI(TAG, "NEWS rotate tick cnt=%u idx=%u", (unsigned int)cnt, (unsigned int)idx);
+        if (cnt > 0) {
+            if (idx >= cnt) idx = 0;
+            if (news_service_get(idx, buf, sizeof(buf))) {
+                PostNewsText(buf, "rotate", idx, cnt);
+            }
+            idx++;
+        } else {
+            PostNewsText("無法取得新聞（稍後會自動重試）", "no_news", idx, cnt);
+        }
+
+        vTaskDelayUntil(&rotate_wake_tick, rotate_ticks);
     }
 }
 
@@ -558,10 +779,8 @@ void UserApp_UiInit() {
     lv_obj_set_size(init_ui.screen_label_7, 60, 24);
     lv_obj_set_style_text_align(init_ui.screen_label_7, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN|LV_STATE_DEFAULT);
 
-    // News label should stick to bottom edge
-    lv_obj_set_pos(init_ui.screen_news_label, 0, 236);
-    lv_obj_set_size(init_ui.screen_news_label, 400, 64);
-    lv_obj_set_style_text_font(init_ui.screen_news_label, news_font, LV_PART_MAIN|LV_STATE_DEFAULT);
+    // News ticker: use animated slide-up labels in a dedicated bottom bar.
+    SetupNewsTickerAnimated(news_font);
 
     // Hide unrelated status/test labels on the clock page.
     lv_obj_add_flag(init_ui.screen_label_5, LV_OBJ_FLAG_HIDDEN);
