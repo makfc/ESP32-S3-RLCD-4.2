@@ -4,19 +4,21 @@
 #include <sys/time.h>
 #include <string.h>
 #include <stdarg.h>
+#include <inttypes.h>
 #include <freertos/FreeRTOS.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include "button_bsp.h"
 #include "user_app.h"
 #include "gui_guider.h"
 #include "i2c_equipment.h"
 #include "i2c_bsp.h"
-#include "sdcard_bsp.h"
 #include "codec_bsp.h"
 #include "adc_bsp.h"
 #include "esp_wifi_bsp.h"
+#include "esp_wifi.h"
 #include "ble_scan_bsp.h"
 #include "news_service.h"
 #include "weather_service.h"
@@ -33,7 +35,6 @@ static const size_t NEWS_TICKER_BUF_INIT_LEN = 1024;
 static char         *s_news_buf = NULL;
 static size_t        s_news_buf_cap = 0;
 static volatile uint32_t s_news_post_seq = 0;
-CustomSDPort *sdcardPort = NULL;
 Shtc3Port *shtc3port = NULL;
 EventGroupHandle_t CodecGroups;
 CodecPort *codecport = NULL;
@@ -637,47 +638,64 @@ void Lvgl_UserTask(void *arg) {
         }
 
         // Update clock once per second from system clock.
+        // Gate on SNTP: show placeholders until first real sync to avoid
+        // displaying a misleading time based on RTC or uninitialised clock.
         {
             static const char * const weekday_zh[] = {
                 "週日","週一","週二","週三","週四","週五","週六"
             };
-            struct tm display_tm = {0};
-            time_t now_epoch = 0;
+            const bool time_valid = espwifi_is_time_synced();
 
-            time(&now_epoch);
-
-            if (now_epoch != last_display_epoch) {
-                last_display_epoch = now_epoch;
-                localtime_r(&now_epoch, &display_tm);
-
-                const int minute_key = (display_tm.tm_hour * 60) + display_tm.tm_min;
-                if (minute_key != last_minute_key) {
-                    last_minute_key = minute_key;
+            if (!time_valid) {
+                if (last_display_epoch != 0 || last_minute_key != -1 || last_date_key != -1) {
+                    last_display_epoch = 0;
+                    last_minute_key = -1;
+                    last_date_key = -1;
                     memset(s_clock_last_text, 0, sizeof(s_clock_last_text));
                     InvalidateClockRow();
+                    SetClockTimeText("--:--:--");
+                    lv_label_set_text(init_ui.screen_label_4, "同步時間中...");
+                    need_refresh = true;
                 }
+            } else {
+                struct tm display_tm = {0};
+                time_t now_epoch = 0;
 
-                snprintf(
-                    lvgl_buffer,
-                    sizeof(lvgl_buffer),
-                    "%02d:%02d:%02d",
-                    display_tm.tm_hour,
-                    display_tm.tm_min,
-                    display_tm.tm_sec
-                );
-                SetClockTimeText(lvgl_buffer);
+                time(&now_epoch);
 
-                const int date_key = (display_tm.tm_year + 1900) * 10000
-                                   + (display_tm.tm_mon + 1) * 100
-                                   + display_tm.tm_mday;
-                if (date_key != last_date_key) {
-                    last_date_key = date_key;
-                    snprintf(lvgl_buffer, 30, "%d月%d日 %s",
-                             display_tm.tm_mon + 1, display_tm.tm_mday,
-                             weekday_zh[display_tm.tm_wday]);
-                    lv_label_set_text(init_ui.screen_label_4, lvgl_buffer);
+                if (now_epoch != last_display_epoch) {
+                    last_display_epoch = now_epoch;
+                    localtime_r(&now_epoch, &display_tm);
+
+                    const int minute_key = (display_tm.tm_hour * 60) + display_tm.tm_min;
+                    if (minute_key != last_minute_key) {
+                        last_minute_key = minute_key;
+                        memset(s_clock_last_text, 0, sizeof(s_clock_last_text));
+                        InvalidateClockRow();
+                    }
+
+                    snprintf(
+                        lvgl_buffer,
+                        sizeof(lvgl_buffer),
+                        "%02d:%02d:%02d",
+                        display_tm.tm_hour,
+                        display_tm.tm_min,
+                        display_tm.tm_sec
+                    );
+                    SetClockTimeText(lvgl_buffer);
+
+                    const int date_key = (display_tm.tm_year + 1900) * 10000
+                                       + (display_tm.tm_mon + 1) * 100
+                                       + display_tm.tm_mday;
+                    if (date_key != last_date_key) {
+                        last_date_key = date_key;
+                        snprintf(lvgl_buffer, 30, "%d月%d日 %s",
+                                 display_tm.tm_mon + 1, display_tm.tm_mday,
+                                 weekday_zh[display_tm.tm_wday]);
+                        lv_label_set_text(init_ui.screen_label_4, lvgl_buffer);
+                    }
+                    need_refresh = true;
                 }
-                need_refresh = true;
             }
         }
 
@@ -755,29 +773,6 @@ void Status_PollTask(void *arg) {
     }
 }
 
-void Lvgl_SDcardTask(void *arg) {
-    const char *str_write = "waveshare.com";
-    char str_read[20] = {""};
-    if(0 == sdcardPort->SDPort_GetStatus()) {
-        if (TryLockLvgl()) {
-            lv_label_set_text(init_ui.screen_label_6, "No Card");
-            Lvgl_unlock();
-        }
-    } else {
-        sdcardPort->SDPort_WriteFile("/sdcard/sdcard.txt",str_write,strlen(str_write));
-        sdcardPort->SDPort_ReadFile("/sdcard/sdcard.txt",(uint8_t *)str_read,NULL);
-        if (TryLockLvgl()) {
-            if(!strcmp(str_write,str_read)) {
-                lv_label_set_text(init_ui.screen_label_6, "passed");
-            } else {
-                lv_label_set_text(init_ui.screen_label_6, "failed");
-            }
-            Lvgl_unlock();
-        }
-    }
-    vTaskDelete(NULL);
-}
-
 void Lvgl_WfifBleScanTask(void *srg) {
     char send_lvgl[10] = {""};
     uint8_t ble_scan_count = 0;
@@ -791,8 +786,25 @@ void Lvgl_WfifBleScanTask(void *srg) {
             ApplyWeatherSnapshot("boot");
         }
     }
+
+    /* Do not tear down Wi-Fi until SNTP has produced at least one real sync;
+     * otherwise the clock UI stays stuck on placeholders for this session. */
+    if (!espwifi_is_time_synced()) {
+        ESP_LOGW(TAG, "SNTP still unsynced before BLE phase; waiting up to 30s");
+        const int64_t wait_start = NowMs();
+        while (!espwifi_is_time_synced() && (NowMs() - wait_start) < 30000) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        ESP_LOGI(TAG, "SNTP wait done synced=%d elapsed=%lld ms",
+                 (int)espwifi_is_time_synced(), (long long)(NowMs() - wait_start));
+    }
+
     espwifi_deinit();
     ble_scan_prepare();
+    ESP_LOGI(TAG, "Heap before BLE init: free=%" PRIu32 " min_internal=%" PRIu32 " largest_internal=%" PRIu32,
+             (uint32_t)esp_get_free_heap_size(),
+             (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     ble_stack_init();
     ble_scan_start();
     for(;xQueueReceive(ble_queue,ble_mac,3500) == pdTRUE;) {
@@ -1031,8 +1043,7 @@ void News_TickerTask(void *arg) {
             } else {
                 PostNewsText("無法取得新聞（稍後會自動重試）", "refresh_empty", 0, new_cnt);
             }
-            now_tick = xTaskGetTickCount();
-            next_refresh_tick = now_tick + (refreshed ? refresh_ticks : retry_ticks);
+            next_refresh_tick = xTaskGetTickCount() + (refreshed ? refresh_ticks : retry_ticks);
             ESP_LOGI(
                 TAG,
                 "NEWS refresh done refreshed=%d new_cnt=%u next_in_ms=%lu",
@@ -1049,38 +1060,24 @@ void UserApp_AppInit() {
     BootStatusPush("開機中...");
     audio_ptr = (uint8_t *)heap_caps_malloc(288 * 1000 * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
     assert(audio_ptr);
-    sdcardPort = new CustomSDPort("/sdcard");
     Adc_PortInit();
     Custom_ButtonInit();
     Rtc_Setup(&I2cbus,0x51);
 
-    // Only reset RTC when year is clearly invalid; preserve time across reboots
+    // RTC hardware time is intentionally NOT used to seed the system clock.
+    // UI must only display time once SNTP has confirmed a real sync; until then
+    // the clock row shows placeholders via espwifi_is_time_synced().
     rtcTimeStruct_t rtcNow;
     Rtc_GetTime(&rtcNow);
     if (rtcNow.year < 2025 || rtcNow.year > 2099) {
         Rtc_SetTime(2026, 1, 5, 14, 30, 30);
         Rtc_GetTime(&rtcNow);
     }
-
-    // Sync system clock from hardware RTC so time()/localtime_r() work correctly
-    struct tm tm_rtc = {
-        .tm_sec   = rtcNow.second,
-        .tm_min   = rtcNow.minute,
-        .tm_hour  = rtcNow.hour,
-        .tm_mday  = rtcNow.day,
-        .tm_mon   = rtcNow.month - 1,
-        .tm_year  = rtcNow.year - 1900,
-        .tm_wday  = rtcNow.week,
-        .tm_yday  = 0,
-        .tm_isdst = -1,
-    };
-    struct timeval tv = { .tv_sec = mktime(&tm_rtc), .tv_usec = 0 };
-    settimeofday(&tv, NULL);
     shtc3port = new Shtc3Port(I2cbus);
     BootStatusPush("Wi-Fi 初始化中...");
     espwifi_init();
     BootStatusPush("Wi-Fi 連線中...");
-    const bool wifi_ready = espwifi_wait_ip(20000);
+    bool wifi_ready = espwifi_wait_ip(20000);
     if (wifi_ready) {
         BootStatusPush("Wi-Fi 已連線: %s", (user_esp_bsp._ip[0] != '\0') ? user_esp_bsp._ip : "unknown");
     } else {
@@ -1092,12 +1089,25 @@ void UserApp_AppInit() {
     ESP_LOGI(TAG, "Timezone configured: %s (GMT+8)", getenv("TZ"));
     LogCurrentLocalTime("Local time before SNTP: ");
 
+    const int MAX_SNTP_ATTEMPTS = 6;
     bool is_ntp_synced = false;
-    if (wifi_ready) {
-        BootStatusPush("SNTP 同步中: time.asia.apple.com");
-        is_ntp_synced = espwifi_sync_time("time.asia.apple.com", 30000);
-    } else {
-        BootStatusPush("SNTP 略過: 未連上 Wi-Fi");
+    for (int attempt = 1; attempt <= MAX_SNTP_ATTEMPTS && !is_ntp_synced; attempt++) {
+        if (!wifi_ready) {
+            BootStatusPush("Wi-Fi 重連中 (%d/%d)", attempt, MAX_SNTP_ATTEMPTS);
+            ESP_LOGW(TAG, "SNTP attempt %d: Wi-Fi not ready, retrying connect", attempt);
+            esp_wifi_connect();
+            wifi_ready = espwifi_wait_ip(15000);
+        }
+        if (wifi_ready) {
+            BootStatusPush("SNTP 同步中 (%d/%d)", attempt, MAX_SNTP_ATTEMPTS);
+            is_ntp_synced = espwifi_sync_time("time.asia.apple.com", 30000);
+            if (!is_ntp_synced) {
+                ESP_LOGW(TAG, "SNTP attempt %d/%d failed", attempt, MAX_SNTP_ATTEMPTS);
+            }
+        } else {
+            BootStatusPush("Wi-Fi 未連線，稍候重試 (%d/%d)", attempt, MAX_SNTP_ATTEMPTS);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
     }
     ESP_LOGI(TAG, "SNTP result: %s", is_ntp_synced ? "SUCCESS" : "FAILED");
     LogCurrentLocalTime("Local time after SNTP: ");
@@ -1118,18 +1128,10 @@ void UserApp_AppInit() {
         );
         ESP_LOGI(TAG, "RTC updated from SNTP time");
     } else {
-        BootStatusPush("SNTP 同步失敗，使用 RTC");
-        ESP_LOGW(TAG, "Use RTC time fallback");
-        ESP_LOGW(
-            TAG,
-            "RTC fallback value: %04d-%02d-%02d %02d:%02d:%02d",
-            rtcNow.year,
-            rtcNow.month,
-            rtcNow.day,
-            rtcNow.hour,
-            rtcNow.minute,
-            rtcNow.second
-        );
+        BootStatusPush("SNTP 屢次失敗，將重新開機...");
+        ESP_LOGE(TAG, "SNTP sync failed after %d attempts, rebooting", MAX_SNTP_ATTEMPTS);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
     }
 
     CodecGroups = xEventGroupCreate();
@@ -1255,7 +1257,6 @@ void UserApp_TaskInit() {
     xTaskCreatePinnedToCore(Lvgl_Cont1Task, "Lvgl_Cont1Task", 4 * 1024, NULL, 2, NULL,1);
     xTaskCreatePinnedToCore(Lvgl_UserTask, "Lvgl_UserTask", 5 * 1024, NULL, 4, NULL,1);
     xTaskCreatePinnedToCore(Status_PollTask, "Status_PollTask", 4 * 1024, NULL, 1, NULL,1);
-    xTaskCreatePinnedToCore(Lvgl_SDcardTask, "Lvgl_SDcardTask", 4 * 1024, NULL, 2, NULL,1);
     xTaskCreatePinnedToCore(Lvgl_WfifBleScanTask, "Lvgl_WfifBleScanTask", 4 * 1024, NULL, 2, NULL,1);
     xTaskCreatePinnedToCore(BOOT_LoopTask, "BOOT_LoopTask", 4 * 1024, NULL, 2, NULL,1);
     xTaskCreatePinnedToCore(KEY_LoopTask, "KEY_LoopTask", 4 * 1024, NULL, 2, NULL,1);

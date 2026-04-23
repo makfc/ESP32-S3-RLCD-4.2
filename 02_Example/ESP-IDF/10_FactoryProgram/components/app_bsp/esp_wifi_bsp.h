@@ -28,6 +28,10 @@ bool espwifi_wait_ip(uint32_t timeout_ms);
  * SNTP remains running for periodic re-sync. */
 bool espwifi_sync_time(const char *server, uint32_t timeout_ms);
 
+/* True once SNTP has produced at least one successful sync callback.
+ * UI layers must gate time/date display on this to avoid showing stale values. */
+bool espwifi_is_time_synced(void);
+
 
 #ifdef __cplusplus
 }

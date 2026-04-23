@@ -132,6 +132,11 @@ bool espwifi_wait_ip(uint32_t timeout_ms)
     return ok;
 }
 
+bool espwifi_is_time_synced(void)
+{
+    return s_sntp_sync_seen;
+}
+
 bool espwifi_sync_time(const char *server, uint32_t timeout_ms)
 {
     const char *ntp_server = (server != NULL && server[0] != '\0') ? server : "pool.ntp.org";
@@ -217,7 +222,13 @@ void espwifi_deinit(void)
     if (esp_sntp_enabled()) {
         esp_sntp_stop();
     }
+    // Gracefully disconnect before stopping so lldesc/txq can drain.
+    // Ignoring errors: disconnect may fail if already disconnected.
+    esp_wifi_disconnect();
     esp_wifi_stop();
+    // Give the WiFi task a moment to release lldesc rx blocks before deinit,
+    // otherwise subsequent BLE init can fail with OOM on bt_workqueue.
+    vTaskDelay(pdMS_TO_TICKS(100));
     esp_wifi_deinit();
     if (net != NULL) {
         esp_netif_destroy_default_wifi(net);
@@ -228,6 +239,8 @@ void espwifi_deinit(void)
         vEventGroupDelete(wifi_even_);
         wifi_even_ = NULL;
     }
+    // Let deferred frees settle before the caller starts BLE.
+    vTaskDelay(pdMS_TO_TICKS(50));
     //esp_netif_deinit();
     //nvs_flash_deinit();
 }
