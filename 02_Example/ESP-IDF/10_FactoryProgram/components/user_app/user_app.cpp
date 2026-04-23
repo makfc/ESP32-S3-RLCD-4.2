@@ -1585,7 +1585,7 @@ void UserApp_UiInit() {
         lv_label_set_long_mode(s_hko_label, LV_LABEL_LONG_CLIP);
         lv_obj_set_style_text_font(s_hko_label, date_font, LV_PART_MAIN|LV_STATE_DEFAULT);
         lv_obj_set_style_text_color(s_hko_label, lv_color_hex(0x000000), LV_PART_MAIN|LV_STATE_DEFAULT);
-        lv_obj_set_style_text_align(s_hko_label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN|LV_STATE_DEFAULT);
+        lv_obj_set_style_text_align(s_hko_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN|LV_STATE_DEFAULT);
         lv_obj_set_style_text_letter_space(s_hko_label, 0, LV_PART_MAIN|LV_STATE_DEFAULT);
         lv_obj_set_style_text_line_space(s_hko_label, 0, LV_PART_MAIN|LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(s_hko_label, 0, LV_PART_MAIN|LV_STATE_DEFAULT);
