@@ -54,8 +54,7 @@ static const uint32_t NEWS_REFRESH_INTERVAL_MS = 30UL * 60UL * 1000UL;
 static const uint32_t NEWS_RETRY_INTERVAL_MS = 60UL * 1000UL;
 static const uint32_t NEWS_LOOP_SLEEP_MS = 500;
 static const uint32_t NEWS_HEADLINE_ROTATE_MS = 5000;
-static const uint32_t NEWS_HEADLINE_SWITCH_ANIM_MS = 320;
-static const uint32_t NEWS_LONG_HEADLINE_MARQUEE_DELAY_MS = 1200;
+static const uint32_t NEWS_TICKER_STEP_MS = 20;
 static const int64_t UI_LOOP_GAP_WARN_MS = 450;
 static const int64_t UI_LOOP_GAP_LOG_INTERVAL_MS = 2000;
 static const int64_t UI_LOOP_BODY_WARN_MS = 80;
@@ -68,12 +67,19 @@ static const int NEWS_BAR_W = 400;
 static const int NEWS_BAR_H = 40;
 static const int NEWS_BAR_LABEL_X = 6;
 static const int NEWS_BAR_LABEL_W = NEWS_BAR_W - 12;
+static const lv_coord_t NEWS_TICKER_GAP_MIN_PX = 18;
+static const lv_coord_t NEWS_TICKER_GAP_MAX_PX = 72;
 static const uint16_t NEWS_LONG_HEADLINE_MARQUEE_SPEED_PX_S = 50;
 static const lv_coord_t NEWS_LONG_HEADLINE_END_EXTRA_PX = 6;
-static bool s_news_marquee_pending = false;
-static int64_t s_news_marquee_start_ms = 0;
-static lv_obj_t *s_news_marquee_target = NULL;
-static lv_coord_t s_news_marquee_target_end_x = NEWS_BAR_LABEL_X;
+static bool s_news_ticker_running = false;
+static int64_t s_news_ticker_last_step_ms = 0;
+static uint32_t s_news_ticker_subpx_accum = 0;
+static lv_coord_t s_news_ticker_w1 = NEWS_BAR_LABEL_W;
+static lv_coord_t s_news_ticker_w2 = NEWS_BAR_LABEL_W;
+static char *s_news_next_buf = NULL;
+static size_t s_news_next_buf_cap = 0;
+static bool s_news_next_pending = false;
+static uint8_t s_news_next_applied_mask = 0;
 static lv_obj_t *s_news_anim_box = NULL;
 static lv_obj_t *s_news_marquee_label = NULL;
 static lv_obj_t *s_news_marquee_label_back = NULL;
@@ -90,6 +96,7 @@ static volatile int s_hko_temperature_c = -1000;
 static volatile int s_hko_icon_code = -1;
 static char s_hko_desc[24] = "天氣";
 static char s_boot_status_text[512] = {0};
+static volatile bool s_main_screen_ready = false;
 static const BaseType_t UI_TASK_CORE_ID = 1;
 static const BaseType_t BG_TASK_CORE_ID = 0;
 static volatile uint32_t s_lvgl_lock_timeout_count = 0;
@@ -122,12 +129,19 @@ static lv_coord_t NewsHeadlineTextWidthPx(lv_obj_t *label, const char *text)
     return text_w;
 }
 
-static lv_coord_t NewsHeadlineOverflowPx(lv_coord_t text_w)
+static lv_coord_t NewsTickerGapPx(lv_coord_t text_w)
 {
-    if (text_w <= NEWS_BAR_LABEL_W) {
-        return 0;
+    if (text_w < 0) {
+        text_w = 0;
     }
-    return (text_w - NEWS_BAR_LABEL_W) + NEWS_LONG_HEADLINE_END_EXTRA_PX;
+    lv_coord_t gap = text_w / 12;
+    if (gap < NEWS_TICKER_GAP_MIN_PX) {
+        gap = NEWS_TICKER_GAP_MIN_PX;
+    }
+    if (gap > NEWS_TICKER_GAP_MAX_PX) {
+        gap = NEWS_TICKER_GAP_MAX_PX;
+    }
+    return gap;
 }
 
 static void NewsLabelAnimSetY(void *obj, int32_t value)
@@ -313,6 +327,26 @@ static bool TryLockLvgl(void)
     return false;
 }
 
+static bool LockLvglForBootTransition(const char *stage)
+{
+    const int64_t t_start_ms = NowMs();
+    if (!Lvgl_lock(-1)) {
+        ESP_LOGE(TAG, "Boot transition lock failed at stage=%s", (stage != NULL) ? stage : "unknown");
+        return false;
+    }
+
+    const int64_t wait_ms = NowMs() - t_start_ms;
+    if (wait_ms >= LVGL_LOCK_TIMEOUT_MS) {
+        ESP_LOGW(
+            TAG,
+            "Boot transition lock waited %lld ms at stage=%s",
+            (long long)wait_ms,
+            (stage != NULL) ? stage : "unknown"
+        );
+    }
+    return true;
+}
+
 static inline int64_t NowMs(void)
 {
     return esp_timer_get_time() / 1000;
@@ -360,6 +394,37 @@ static bool EnsureNewsBuffer(size_t need_len)
     return true;
 }
 
+static bool EnsureNewsNextBuffer(size_t need_len)
+{
+    if (need_len == 0) {
+        need_len = 1;
+    }
+    if ((s_news_next_buf != NULL) && (need_len <= s_news_next_buf_cap)) {
+        return true;
+    }
+
+    size_t new_cap = (s_news_next_buf_cap > 0) ? s_news_next_buf_cap : NEWS_TICKER_BUF_INIT_LEN;
+    while (new_cap < need_len) {
+        if (new_cap >= (64 * 1024)) {
+            new_cap = need_len;
+            break;
+        }
+        new_cap *= 2;
+    }
+
+    char *new_buf = (char *)heap_caps_realloc(s_news_next_buf, new_cap, MALLOC_CAP_SPIRAM);
+    if (new_buf == NULL) {
+        new_buf = (char *)realloc(s_news_next_buf, new_cap);
+    }
+    if (new_buf == NULL) {
+        ESP_LOGE(TAG, "NEWS next buffer alloc failed need=%u", (unsigned int)need_len);
+        return false;
+    }
+    s_news_next_buf = new_buf;
+    s_news_next_buf_cap = new_cap;
+    return true;
+}
+
 static bool PostNewsHeadlineByIndex(size_t idx, const char *reason)
 {
     char title[NEWS_TITLE_LEN] = {0};
@@ -398,6 +463,156 @@ static void PostNewsText(const char *text, const char *reason, size_t idx, size_
     );
 }
 
+static lv_coord_t NewsTickerLabelWidthPx(lv_coord_t text_w)
+{
+    if (text_w <= 0) {
+        return NEWS_BAR_LABEL_W;
+    }
+    return text_w + NEWS_LONG_HEADLINE_END_EXTRA_PX;
+}
+
+static lv_coord_t NewsTickerApplyTextToLabel(lv_obj_t *label, const char *text)
+{
+    if (label == NULL) {
+        return NEWS_BAR_LABEL_W;
+    }
+    if (text == NULL) {
+        text = "";
+    }
+
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(label, text);
+    const lv_coord_t text_w = NewsHeadlineTextWidthPx(label, text);
+    const lv_coord_t label_w = NewsTickerLabelWidthPx(text_w);
+    lv_obj_set_width(label, label_w);
+    lv_obj_set_y(label, 0);
+    return label_w;
+}
+
+static void NewsTickerReset(const char *text)
+{
+    if (text == NULL) {
+        text = "";
+    }
+    if ((s_news_marquee_label == NULL) || (s_news_marquee_label_back == NULL)) {
+        return;
+    }
+
+    lv_anim_del(s_news_marquee_label, NewsLabelAnimSetX);
+    lv_anim_del(s_news_marquee_label_back, NewsLabelAnimSetX);
+    lv_anim_del(s_news_marquee_label, NewsLabelAnimSetY);
+    lv_anim_del(s_news_marquee_label_back, NewsLabelAnimSetY);
+
+    s_news_ticker_w1 = NewsTickerApplyTextToLabel(s_news_marquee_label, text);
+    s_news_ticker_w2 = NewsTickerApplyTextToLabel(s_news_marquee_label_back, text);
+
+    const lv_coord_t gap = NewsTickerGapPx(s_news_ticker_w1);
+    lv_obj_set_x(s_news_marquee_label, NEWS_BAR_LABEL_X);
+    lv_obj_set_x(s_news_marquee_label_back, NEWS_BAR_LABEL_X + s_news_ticker_w1 + gap);
+
+    s_news_ticker_running = true;
+    s_news_ticker_last_step_ms = NowMs();
+    s_news_ticker_subpx_accum = 0;
+    s_news_next_pending = false;
+    s_news_next_applied_mask = 0;
+}
+
+static void NewsTickerQueueText(const char *text)
+{
+    if (text == NULL) {
+        text = "";
+    }
+    if ((s_news_marquee_label == NULL) || (s_news_marquee_label_back == NULL)) {
+        return;
+    }
+
+    const char *t1 = lv_label_get_text(s_news_marquee_label);
+    const char *t2 = lv_label_get_text(s_news_marquee_label_back);
+    if (s_news_next_pending) {
+        if ((s_news_next_buf != NULL) && (strcmp(s_news_next_buf, text) == 0)) {
+            return;
+        }
+    } else if ((t1 != NULL) && (t2 != NULL) && (strcmp(t1, text) == 0) && (strcmp(t2, text) == 0)) {
+        return;
+    }
+
+    const size_t text_len = strlen(text);
+    if (!EnsureNewsNextBuffer(text_len + 1)) {
+        return;
+    }
+    strlcpy(s_news_next_buf, text, s_news_next_buf_cap);
+    s_news_next_pending = true;
+    s_news_next_applied_mask = 0;
+}
+
+static void NewsTickerApplyPendingToLabelIfNeeded(lv_obj_t *label, lv_coord_t *label_w, uint8_t bit_mask)
+{
+    if (!s_news_next_pending || (label == NULL) || (label_w == NULL)) {
+        return;
+    }
+    if ((s_news_next_applied_mask & bit_mask) != 0) {
+        return;
+    }
+    *label_w = NewsTickerApplyTextToLabel(label, s_news_next_buf);
+    s_news_next_applied_mask |= bit_mask;
+    if (s_news_next_applied_mask == 0x03) {
+        s_news_next_pending = false;
+        s_news_next_applied_mask = 0;
+    }
+}
+
+static bool NewsTickerStep(int64_t now_ms)
+{
+    if (!s_news_ticker_running || (s_news_marquee_label == NULL) || (s_news_marquee_label_back == NULL)) {
+        return false;
+    }
+
+    int64_t dt_ms = now_ms - s_news_ticker_last_step_ms;
+    if (dt_ms <= 0) {
+        return false;
+    }
+    s_news_ticker_last_step_ms = now_ms;
+
+    uint64_t pixel_scaled =
+        ((uint64_t)NEWS_LONG_HEADLINE_MARQUEE_SPEED_PX_S * (uint64_t)dt_ms) + (uint64_t)s_news_ticker_subpx_accum;
+    lv_coord_t move_px = (lv_coord_t)(pixel_scaled / 1000ULL);
+    s_news_ticker_subpx_accum = (uint32_t)(pixel_scaled % 1000ULL);
+    if (move_px <= 0) {
+        return false;
+    }
+
+    lv_obj_set_x(s_news_marquee_label, lv_obj_get_x(s_news_marquee_label) - move_px);
+    lv_obj_set_x(s_news_marquee_label_back, lv_obj_get_x(s_news_marquee_label_back) - move_px);
+
+    for (int i = 0; i < 2; i++) {
+        bool recycled = false;
+
+        const lv_coord_t x1 = lv_obj_get_x(s_news_marquee_label);
+        if ((x1 + s_news_ticker_w1) <= NEWS_BAR_LABEL_X) {
+            NewsTickerApplyPendingToLabelIfNeeded(s_news_marquee_label, &s_news_ticker_w1, 0x01);
+            const lv_coord_t x2 = lv_obj_get_x(s_news_marquee_label_back);
+            const lv_coord_t gap = NewsTickerGapPx(s_news_ticker_w2);
+            lv_obj_set_x(s_news_marquee_label, x2 + s_news_ticker_w2 + gap);
+            recycled = true;
+        }
+
+        const lv_coord_t x2 = lv_obj_get_x(s_news_marquee_label_back);
+        if ((x2 + s_news_ticker_w2) <= NEWS_BAR_LABEL_X) {
+            NewsTickerApplyPendingToLabelIfNeeded(s_news_marquee_label_back, &s_news_ticker_w2, 0x02);
+            const lv_coord_t x1_new = lv_obj_get_x(s_news_marquee_label);
+            const lv_coord_t gap = NewsTickerGapPx(s_news_ticker_w1);
+            lv_obj_set_x(s_news_marquee_label_back, x1_new + s_news_ticker_w1 + gap);
+            recycled = true;
+        }
+
+        if (!recycled) {
+            break;
+        }
+    }
+
+    return true;
+}
+
 static void NewsBarApplyTextAnimated(const char *text)
 {
     if (text == NULL) {
@@ -405,84 +620,14 @@ static void NewsBarApplyTextAnimated(const char *text)
     }
 
     if (s_news_marquee_label == NULL) {
-        s_news_marquee_pending = false;
-        s_news_marquee_start_ms = 0;
-        s_news_marquee_target = NULL;
-        s_news_marquee_target_end_x = NEWS_BAR_LABEL_X;
         lv_label_set_text(init_ui.screen_news_label, text);
         return;
     }
 
-    lv_obj_t *current_label = s_news_marquee_label;
-    lv_obj_t *next_label = s_news_marquee_label_back;
-    if (next_label == NULL) {
-        next_label = s_news_marquee_label;
-    }
-
-    lv_anim_del(current_label, NewsLabelAnimSetY);
-    lv_anim_del(current_label, NewsLabelAnimSetX);
-    if (next_label != current_label) {
-        lv_anim_del(next_label, NewsLabelAnimSetY);
-        lv_anim_del(next_label, NewsLabelAnimSetX);
-    }
-
-    const char *current_text = lv_label_get_text(current_label);
-    const bool has_current_text = (current_text != NULL) && (current_text[0] != '\0');
-    const bool is_same_text = (current_text != NULL) && (strcmp(current_text, text) == 0);
-    const bool do_slide = (next_label != current_label) && has_current_text && !is_same_text;
-
-    lv_label_set_long_mode(current_label, LV_LABEL_LONG_CLIP);
-    lv_obj_set_y(current_label, 0);
-    lv_obj_set_x(current_label, NEWS_BAR_LABEL_X);
-
-    lv_label_set_long_mode(next_label, LV_LABEL_LONG_CLIP);
-    lv_label_set_text(next_label, text);
-    lv_obj_set_y(next_label, do_slide ? NEWS_BAR_H : 0);
-    lv_obj_set_x(next_label, NEWS_BAR_LABEL_X);
-    const lv_coord_t text_w = NewsHeadlineTextWidthPx(next_label, text);
-    const lv_coord_t overflow_px = NewsHeadlineOverflowPx(text_w);
-    lv_obj_set_width(next_label, NEWS_BAR_LABEL_W + overflow_px);
-
-    if (do_slide) {
-        lv_anim_t out_anim;
-        lv_anim_init(&out_anim);
-        lv_anim_set_var(&out_anim, current_label);
-        lv_anim_set_exec_cb(&out_anim, NewsLabelAnimSetY);
-        lv_anim_set_values(&out_anim, 0, -NEWS_BAR_H);
-        lv_anim_set_time(&out_anim, NEWS_HEADLINE_SWITCH_ANIM_MS);
-        lv_anim_set_path_cb(&out_anim, lv_anim_path_ease_out);
-        lv_anim_start(&out_anim);
-
-        lv_anim_t in_anim;
-        lv_anim_init(&in_anim);
-        lv_anim_set_var(&in_anim, next_label);
-        lv_anim_set_exec_cb(&in_anim, NewsLabelAnimSetY);
-        lv_anim_set_values(&in_anim, NEWS_BAR_H, 0);
-        lv_anim_set_time(&in_anim, NEWS_HEADLINE_SWITCH_ANIM_MS);
-        lv_anim_set_path_cb(&in_anim, lv_anim_path_ease_out);
-        lv_anim_start(&in_anim);
-    } else if (next_label != current_label) {
-        lv_obj_set_y(current_label, -NEWS_BAR_H);
-        lv_obj_set_y(next_label, 0);
-    }
-
-    if (next_label != current_label) {
-        s_news_marquee_label = next_label;
-        s_news_marquee_label_back = current_label;
-    }
-
-    const bool need_marquee = overflow_px > 0;
-    if (need_marquee) {
-        s_news_marquee_pending = true;
-        s_news_marquee_target = s_news_marquee_label;
-        s_news_marquee_target_end_x = NEWS_BAR_LABEL_X - overflow_px;
-        s_news_marquee_start_ms =
-            NowMs() + NEWS_LONG_HEADLINE_MARQUEE_DELAY_MS + (do_slide ? NEWS_HEADLINE_SWITCH_ANIM_MS : 0);
+    if (!s_news_ticker_running) {
+        NewsTickerReset(text);
     } else {
-        s_news_marquee_pending = false;
-        s_news_marquee_start_ms = 0;
-        s_news_marquee_target = NULL;
-        s_news_marquee_target_end_x = NEWS_BAR_LABEL_X;
+        NewsTickerQueueText(text);
     }
 }
 
@@ -519,7 +664,16 @@ static void SetupNewsTickerAnimated(const lv_font_t *news_font)
 
     s_news_marquee_label_back = lv_label_create(s_news_anim_box);
     SetupNewsHeadlineLabelStyle(s_news_marquee_label_back, news_font);
-    lv_obj_set_y(s_news_marquee_label_back, NEWS_BAR_H);
+    lv_obj_set_y(s_news_marquee_label_back, 0);
+    lv_obj_set_x(s_news_marquee_label_back, NEWS_BAR_LABEL_X + NEWS_BAR_LABEL_W + NewsTickerGapPx(NEWS_BAR_LABEL_W));
+
+    s_news_ticker_running = false;
+    s_news_ticker_last_step_ms = 0;
+    s_news_ticker_subpx_accum = 0;
+    s_news_ticker_w1 = NEWS_BAR_LABEL_W;
+    s_news_ticker_w2 = NEWS_BAR_LABEL_W;
+    s_news_next_pending = false;
+    s_news_next_applied_mask = 0;
 }
 
 static bool FontHasGlyph(const lv_font_t *font, uint32_t codepoint)
@@ -648,23 +802,27 @@ static void SetupClockTimeSlots(void)
 }
 
 void Lvgl_Cont1Task(void *arg) {
-    if (TryLockLvgl()) {
+    if (LockLvglForBootTransition("show_boot_line_1")) {
         lv_obj_clear_flag(init_ui.screen_label_1, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(init_ui.screen_label_2, LV_OBJ_FLAG_HIDDEN);
         Lvgl_unlock();
     }
     vTaskDelay(pdMS_TO_TICKS(1500));
-    if (TryLockLvgl()) {
+    if (LockLvglForBootTransition("show_boot_line_2")) {
         lv_obj_clear_flag(init_ui.screen_label_2, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(init_ui.screen_label_1, LV_OBJ_FLAG_HIDDEN);
         Lvgl_unlock();
     }
     vTaskDelay(pdMS_TO_TICKS(1500));
-    if (TryLockLvgl()) {
+    if (LockLvglForBootTransition("enter_main_screen")) {
         lv_obj_clear_flag(init_ui.screen_cont_2, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(init_ui.screen_cont_1, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(init_ui.screen_cont_3, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(init_ui.screen_cont_4, LV_OBJ_FLAG_HIDDEN);
         Lvgl_unlock();
+        s_main_screen_ready = true;
+        Lvgl_request_refresh();
+        ESP_LOGI(TAG, "Boot transition: entered main screen");
     }
     vTaskDelete(NULL); 
 }
@@ -684,6 +842,11 @@ void Lvgl_UserTask(void *arg) {
     int64_t last_loop_body_warn_ms = 0;
 
     for(;;) {
+        if (!s_main_screen_ready) {
+            vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(100));
+            continue;
+        }
+
         const int64_t loop_start_ms = NowMs();
         if (last_loop_start_ms != 0) {
             const int64_t loop_gap_ms = loop_start_ms - last_loop_start_ms;
@@ -707,10 +870,10 @@ void Lvgl_UserTask(void *arg) {
             clock_needs_update = (now_epoch != last_display_epoch);
         }
 
-        const bool marquee_start_due =
-            s_news_marquee_pending && (loop_start_ms >= s_news_marquee_start_ms);
+        const bool ticker_step_due =
+            s_news_ticker_running && ((loop_start_ms - s_news_ticker_last_step_ms) >= NEWS_TICKER_STEP_MS);
         const bool has_pending_ui_work =
-            s_status_dirty || s_news_show || s_news_dirty || clock_needs_update || marquee_start_due;
+            s_status_dirty || s_news_show || s_news_dirty || clock_needs_update || ticker_step_due;
         if (!has_pending_ui_work) {
             vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(CLOCK_POLL_MS));
             continue;
@@ -846,36 +1009,8 @@ void Lvgl_UserTask(void *arg) {
             NewsBarApplyTextAnimated(s_news_buf);
             ESP_LOGD(TAG, "NEWS apply #%lu text=\"%.64s\"", (unsigned long)s_news_post_seq, s_news_buf);
         }
-        if (s_news_marquee_pending && (NowMs() >= s_news_marquee_start_ms)) {
-            s_news_marquee_pending = false;
-            s_news_marquee_start_ms = 0;
-            lv_obj_t *target = s_news_marquee_target;
-            const lv_coord_t end_x = s_news_marquee_target_end_x;
-            s_news_marquee_target = NULL;
-            s_news_marquee_target_end_x = NEWS_BAR_LABEL_X;
-
-            if ((target != NULL) && (end_x < NEWS_BAR_LABEL_X)) {
-                lv_anim_del(target, NewsLabelAnimSetX);
-                lv_obj_set_x(target, NEWS_BAR_LABEL_X);
-
-                const int32_t distance_px = (int32_t)(NEWS_BAR_LABEL_X - end_x);
-                uint32_t duration_ms =
-                    (uint32_t)(((int64_t)distance_px * 1000 + NEWS_LONG_HEADLINE_MARQUEE_SPEED_PX_S - 1)
-                    / NEWS_LONG_HEADLINE_MARQUEE_SPEED_PX_S);
-                if (duration_ms < 200) {
-                    duration_ms = 200;
-                }
-
-                lv_anim_t marquee_anim;
-                lv_anim_init(&marquee_anim);
-                lv_anim_set_var(&marquee_anim, target);
-                lv_anim_set_exec_cb(&marquee_anim, NewsLabelAnimSetX);
-                lv_anim_set_values(&marquee_anim, NEWS_BAR_LABEL_X, end_x);
-                lv_anim_set_time(&marquee_anim, duration_ms);
-                lv_anim_set_path_cb(&marquee_anim, lv_anim_path_linear);
-                lv_anim_start(&marquee_anim);
-                need_refresh = true;
-            }
+        if (s_news_ticker_running && NewsTickerStep(NowMs())) {
+            need_refresh = true;
         }
 
         Lvgl_unlock();
@@ -890,7 +1025,8 @@ void Lvgl_UserTask(void *arg) {
             last_loop_body_warn_ms = now_ms;
             ESP_LOGW(TAG, "UI loop body took %lld ms", (long long)loop_body_ms);
         }
-        vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(CLOCK_POLL_MS));
+        const uint32_t loop_sleep_ms = s_news_ticker_running ? NEWS_TICKER_STEP_MS : CLOCK_POLL_MS;
+        vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(loop_sleep_ms));
     }
 }
 
@@ -1178,18 +1314,24 @@ void News_TickerTask(void *arg) {
         return ok;
     };
 
-    /* Signal Lvgl_UserTask to show bar with loading message */
-    PostNewsText("正在連接網絡，抓取新聞中...", "boot_wait", 0, 0);
-    s_news_show  = true;
+    /* Do not start ticker before boot transition enters main screen. */
+    while (!s_main_screen_ready) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI(TAG, "NEWS ticker: main screen ready, waiting headline data");
 
-    /* Wait up to 60 s for news_service_fetch() to complete */
-    uint8_t waited = 0;
-    while (news_service_count() == 0 && waited < 60) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        waited++;
+    /* Ticker should only start after we have at least one fetched headline. */
+    while (news_service_count() == 0) {
+        ESP_LOGW(TAG, "NEWS ticker: no headline yet, retry fetch");
+        (void)periodic_fetch_news();
+        if (news_service_count() == 0) {
+            vTaskDelay(retry_ticks);
+        }
     }
 
-    TickType_t next_refresh_tick = xTaskGetTickCount() + ((news_service_count() > 0) ? refresh_ticks : 0);
+    s_news_show = true;
+
+    TickType_t next_refresh_tick = xTaskGetTickCount() + refresh_ticks;
     TickType_t next_rotate_tick = xTaskGetTickCount();
     size_t rotate_idx = 0;
     const size_t boot_cnt = news_service_count();

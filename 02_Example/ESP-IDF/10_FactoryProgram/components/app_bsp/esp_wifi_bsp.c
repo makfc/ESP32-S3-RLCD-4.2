@@ -19,6 +19,7 @@ esp_bsp_t user_esp_bsp;
 static esp_netif_t *net = NULL;
 static const char *TAG = "wifiSta";
 static volatile bool s_sntp_sync_seen = false;
+static volatile TickType_t s_last_got_ip_tick = 0;
 
 static const char *SntpSyncStatusToStr(sntp_sync_status_t status)
 {
@@ -32,6 +33,69 @@ static const char *SntpSyncStatusToStr(sntp_sync_status_t status)
         default:
             return "UNKNOWN";
     }
+}
+
+static bool IsDnsV4Valid(const esp_netif_dns_info_t *dns_info)
+{
+    if (dns_info == NULL) {
+        return false;
+    }
+    if (dns_info->ip.type != ESP_IPADDR_TYPE_V4) {
+        return false;
+    }
+    return dns_info->ip.u_addr.ip4.addr != 0;
+}
+
+static void WaitForPostIpSettle(uint32_t settle_ms)
+{
+    if (settle_ms == 0) {
+        return;
+    }
+    const TickType_t got_ip_tick = s_last_got_ip_tick;
+    if (got_ip_tick == 0) {
+        return;
+    }
+
+    const TickType_t settle_ticks = pdMS_TO_TICKS(settle_ms);
+    const TickType_t now_tick = xTaskGetTickCount();
+    const TickType_t elapsed_ticks = now_tick - got_ip_tick;
+    if (elapsed_ticks >= settle_ticks) {
+        return;
+    }
+
+    const TickType_t remain_ticks = settle_ticks - elapsed_ticks;
+    const uint32_t wait_ms = (uint32_t)((remain_ticks * 1000UL) / configTICK_RATE_HZ);
+    ESP_LOGI(TAG, "SNTP preflight: wait post-IP settle %lu ms", (unsigned long)wait_ms);
+    vTaskDelay(remain_ticks);
+}
+
+static bool WaitForDnsReady(uint32_t timeout_ms)
+{
+    if (net == NULL) {
+        return false;
+    }
+
+    const int64_t start_us = esp_timer_get_time();
+    while ((uint32_t)((esp_timer_get_time() - start_us) / 1000ULL) < timeout_ms) {
+        esp_netif_dns_info_t dns_main = {0};
+        if ((esp_netif_get_dns_info(net, ESP_NETIF_DNS_MAIN, &dns_main) == ESP_OK) && IsDnsV4Valid(&dns_main)) {
+            const esp_ip4_addr_t *dns4 = &dns_main.ip.u_addr.ip4;
+            ESP_LOGI(TAG, "SNTP preflight: DNS ready " IPSTR, IP2STR(dns4));
+            return true;
+        }
+
+        esp_netif_dns_info_t dns_backup = {0};
+        if ((esp_netif_get_dns_info(net, ESP_NETIF_DNS_BACKUP, &dns_backup) == ESP_OK) && IsDnsV4Valid(&dns_backup)) {
+            const esp_ip4_addr_t *dns4 = &dns_backup.ip.u_addr.ip4;
+            ESP_LOGI(TAG, "SNTP preflight: backup DNS ready " IPSTR, IP2STR(dns4));
+            return true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGW(TAG, "SNTP preflight: DNS still not ready after %lu ms", (unsigned long)timeout_ms);
+    return false;
 }
 
 static void SntpSyncNotificationCb(struct timeval *tv)
@@ -97,13 +161,16 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         uint32_t pxip = event->ip_info.ip.addr;
         sprintf(ip, "%d.%d.%d.%d", (uint8_t)(pxip), (uint8_t)(pxip >> 8), (uint8_t)(pxip >> 16), (uint8_t)(pxip >> 24));
         strncpy(user_esp_bsp._ip, ip, sizeof(user_esp_bsp._ip) - 1);
+        s_last_got_ip_tick = xTaskGetTickCount();
         ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP: %s", ip);
         xEventGroupSetBits(wifi_even_, 0x04);   /* signal: has IP */
     } else if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_LOST_IP)) {
         ESP_LOGW(TAG, "IP_EVENT_STA_LOST_IP");
+        s_last_got_ip_tick = 0;
         xEventGroupClearBits(wifi_even_, 0x04);
     } else if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_DISCONNECTED)) {
         ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED");
+        s_last_got_ip_tick = 0;
         xEventGroupClearBits(wifi_even_, 0x04);
     }
 }
@@ -141,10 +208,16 @@ bool espwifi_sync_time(const char *server, uint32_t timeout_ms)
 {
     const char *ntp_server = (server != NULL && server[0] != '\0') ? server : "pool.ntp.org";
     const uint32_t sync_interval_ms = 60UL * 60UL * 1000UL; // 1 hour
+    const bool had_synced_before = s_sntp_sync_seen;
 
     if (!espwifi_wait_ip(timeout_ms)) {
         ESP_LOGW(TAG, "SNTP skipped: no IP within %lu ms", (unsigned long)timeout_ms);
         return false;
+    }
+
+    if (!had_synced_before) {
+        WaitForPostIpSettle(1200);
+        (void)WaitForDnsReady(3000);
     }
 
     ESP_LOGI(
