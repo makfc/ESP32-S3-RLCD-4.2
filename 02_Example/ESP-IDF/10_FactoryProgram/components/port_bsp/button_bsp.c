@@ -2,8 +2,11 @@
 #include <driver/gpio.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_system.h>
 #include "button_bsp.h"
 #include "multi_button.h"
+
+static const char *TAG = "BUTTON_BSP";
 
 EventGroupHandle_t BootButtonGroups;
 EventGroupHandle_t GP18ButtonGroups;
@@ -19,8 +22,10 @@ static Button GP18Button;
 #define GP18_Active 0       
 
 /*******************Callback event declaration***************/
+
 static void on_boot_single_click(Button *btn_handle) {
-    xEventGroupSetBits(BootButtonGroups, set_bit_button(0));
+    ESP_LOGI(TAG, "Boot button single-click: rebooting...");
+    esp_restart();
 }
 
 static void on_boot_double_click(Button *btn_handle) {
