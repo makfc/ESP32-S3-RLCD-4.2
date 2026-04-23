@@ -43,14 +43,21 @@ static bool is_Music = true;
 static lv_obj_t *s_clock_char_labels[8] = {0};
 static const char *TAG = "user_app";
 static char s_clock_last_text[9] = {'\0'};
-static const uint32_t CLOCK_POLL_MS = 50;
+static const uint32_t CLOCK_POLL_MS = 200;
 static const uint32_t STATUS_POLL_MS = 100;
+static const int LVGL_LOCK_TIMEOUT_MS = 220;
+static const int64_t LVGL_LOCK_LOG_INTERVAL_MS = 2000;
+static const int64_t UI_LOOP_BODY_LOG_INTERVAL_MS = 2000;
 static const uint32_t BATTERY_INTERVAL_MS = 2000;
 static const uint32_t SENSOR_INTERVAL_MS = 5000;
 static const uint32_t NEWS_REFRESH_INTERVAL_MS = 30UL * 60UL * 1000UL;
 static const uint32_t NEWS_RETRY_INTERVAL_MS = 60UL * 1000UL;
 static const uint32_t NEWS_LOOP_SLEEP_MS = 500;
-static const int64_t UI_LOOP_GAP_WARN_MS = 250;
+static const uint32_t NEWS_HEADLINE_ROTATE_MS = 5000;
+static const uint32_t NEWS_HEADLINE_SWITCH_ANIM_MS = 320;
+static const uint32_t NEWS_LONG_HEADLINE_MARQUEE_DELAY_MS = 1200;
+static const int64_t UI_LOOP_GAP_WARN_MS = 450;
+static const int64_t UI_LOOP_GAP_LOG_INTERVAL_MS = 2000;
 static const int64_t UI_LOOP_BODY_WARN_MS = 80;
 static const int64_t ADC_BLOCK_WARN_MS = 15;
 static const int64_t SENSOR_BLOCK_WARN_MS = 60;
@@ -59,13 +66,19 @@ static const int NEWS_BAR_X = 0;
 static const int NEWS_BAR_Y = 260;
 static const int NEWS_BAR_W = 400;
 static const int NEWS_BAR_H = 40;
+static const int NEWS_BAR_LABEL_X = 6;
+static const int NEWS_BAR_LABEL_W = NEWS_BAR_W - 12;
+static const uint16_t NEWS_LONG_HEADLINE_MARQUEE_SPEED_PX_S = 50;
+static const lv_coord_t NEWS_LONG_HEADLINE_END_EXTRA_PX = 6;
+static bool s_news_marquee_pending = false;
+static int64_t s_news_marquee_start_ms = 0;
+static lv_obj_t *s_news_marquee_target = NULL;
+static lv_coord_t s_news_marquee_target_end_x = NEWS_BAR_LABEL_X;
 static lv_obj_t *s_news_anim_box = NULL;
 static lv_obj_t *s_news_marquee_label = NULL;
+static lv_obj_t *s_news_marquee_label_back = NULL;
 static lv_obj_t *s_hko_bar = NULL;
 static lv_obj_t *s_hko_label = NULL;
-static lv_anim_t s_news_anim_template;
-static lv_style_t s_news_anim_style;
-static bool s_news_anim_style_inited = false;
 static volatile bool s_status_dirty = true;
 static volatile int s_battery_level = -1;
 static volatile int s_humidity_percent = -1;    // Display humidity
@@ -77,9 +90,87 @@ static volatile int s_hko_temperature_c = -1000;
 static volatile int s_hko_icon_code = -1;
 static char s_hko_desc[24] = "天氣";
 static char s_boot_status_text[512] = {0};
+static const BaseType_t UI_TASK_CORE_ID = 1;
+static const BaseType_t BG_TASK_CORE_ID = 0;
+static volatile uint32_t s_lvgl_lock_timeout_count = 0;
+static int64_t s_lvgl_lock_last_log_ms = 0;
 
+static void PostNewsText(const char *text, const char *reason, size_t idx, size_t cnt);
 static void NewsBarApplyTextAnimated(const char *text);
 static bool TryLockLvgl(void);
+static inline int64_t NowMs(void);
+
+static lv_coord_t NewsHeadlineTextWidthPx(lv_obj_t *label, const char *text)
+{
+    if (text == NULL || text[0] == '\0') {
+        return 0;
+    }
+    if (label == NULL) {
+        return 0;
+    }
+
+    const lv_font_t *font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+    if (font == NULL) {
+        return 0;
+    }
+
+    const lv_coord_t letter_space = lv_obj_get_style_text_letter_space(label, LV_PART_MAIN);
+    const lv_coord_t text_w = lv_txt_get_width(text, strlen(text), font, letter_space, LV_TEXT_FLAG_NONE);
+    if (text_w <= 0) {
+        return 0;
+    }
+    return text_w;
+}
+
+static lv_coord_t NewsHeadlineOverflowPx(lv_coord_t text_w)
+{
+    if (text_w <= NEWS_BAR_LABEL_W) {
+        return 0;
+    }
+    return (text_w - NEWS_BAR_LABEL_W) + NEWS_LONG_HEADLINE_END_EXTRA_PX;
+}
+
+static void NewsLabelAnimSetY(void *obj, int32_t value)
+{
+    if (obj == NULL) {
+        return;
+    }
+    lv_obj_set_y((lv_obj_t *)obj, (lv_coord_t)value);
+}
+
+static void NewsLabelAnimSetX(void *obj, int32_t value)
+{
+    if (obj == NULL) {
+        return;
+    }
+    lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)value);
+}
+
+static void SetupNewsHeadlineLabelStyle(lv_obj_t *label, const lv_font_t *news_font)
+{
+    if (label == NULL) {
+        return;
+    }
+
+    lv_label_set_text(label, "");
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_size(label, NEWS_BAR_LABEL_W, NEWS_BAR_H);
+    lv_obj_set_x(label, NEWS_BAR_LABEL_X);
+    lv_obj_set_style_border_width(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(label, news_font, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_opa(label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_letter_space(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_line_space(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_left(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_right(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_shadow_width(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+}
 static void BootStatusPush(const char *fmt, ...)
 {
     if ((fmt == NULL) || (fmt[0] == '\0')) {
@@ -203,10 +294,22 @@ static void ApplyWeatherSnapshot(const char *reason)
 
 static bool TryLockLvgl(void)
 {
-    if (Lvgl_lock(30)) {
+    if (Lvgl_lock(LVGL_LOCK_TIMEOUT_MS)) {
         return true;
     }
-    ESP_LOGW(TAG, "LVGL lock timeout");
+    s_lvgl_lock_timeout_count++;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if ((now_ms - s_lvgl_lock_last_log_ms) >= LVGL_LOCK_LOG_INTERVAL_MS) {
+        const uint32_t timeout_count = s_lvgl_lock_timeout_count;
+        s_lvgl_lock_timeout_count = 0;
+        s_lvgl_lock_last_log_ms = now_ms;
+        ESP_LOGW(
+            TAG,
+            "LVGL lock timeout x%lu in last %lld ms",
+            (unsigned long)timeout_count,
+            (long long)LVGL_LOCK_LOG_INTERVAL_MS
+        );
+    }
     return false;
 }
 
@@ -257,62 +360,18 @@ static bool EnsureNewsBuffer(size_t need_len)
     return true;
 }
 
-static char *BuildNewsTickerText(size_t *used_items)
+static bool PostNewsHeadlineByIndex(size_t idx, const char *reason)
 {
-    static const char *sep = "   ｜   ";
-    const size_t sep_len = strlen(sep);
-    const size_t cnt = news_service_count();
     char title[NEWS_TITLE_LEN] = {0};
-    size_t appended = 0;
-    size_t total_len = 1; // trailing '\0'
-
-    for (size_t i = 0; i < cnt; i++) {
-        if (!news_service_get(i, title, sizeof(title))) {
-            continue;
-        }
-        if (title[0] == '\0') {
-            continue;
-        }
-        total_len += strlen(title);
-        if (appended > 0) {
-            total_len += sep_len;
-        }
-        appended++;
+    const size_t cnt = news_service_count();
+    if (cnt == 0 || idx >= cnt) {
+        return false;
     }
-
-    if (used_items != NULL) {
-        *used_items = appended;
+    if (!news_service_get(idx, title, sizeof(title)) || title[0] == '\0') {
+        return false;
     }
-    if (appended == 0) {
-        return NULL;
-    }
-
-    char *out = (char *)heap_caps_malloc(total_len, MALLOC_CAP_SPIRAM);
-    if (out == NULL) {
-        out = (char *)malloc(total_len);
-    }
-    if (out == NULL) {
-        ESP_LOGE(TAG, "NEWS ticker alloc failed len=%u", (unsigned int)total_len);
-        return NULL;
-    }
-
-    out[0] = '\0';
-    appended = 0;
-    for (size_t i = 0; i < cnt; i++) {
-        if (!news_service_get(i, title, sizeof(title))) {
-            continue;
-        }
-        if (title[0] == '\0') {
-            continue;
-        }
-        if (appended > 0) {
-            strlcat(out, sep, total_len);
-        }
-        strlcat(out, title, total_len);
-        appended++;
-    }
-
-    return out;
+    PostNewsText(title, reason, idx + 1, cnt);
+    return true;
 }
 
 static void PostNewsText(const char *text, const char *reason, size_t idx, size_t cnt)
@@ -327,7 +386,7 @@ static void PostNewsText(const char *text, const char *reason, size_t idx, size_
     strlcpy(s_news_buf, text, s_news_buf_cap);
     s_news_post_seq++;
     s_news_dirty = true;
-    ESP_LOGI(
+    ESP_LOGD(
         TAG,
         "NEWS post #%lu reason=%s idx=%u cnt=%u len=%u text=\"%.64s\"",
         (unsigned long)s_news_post_seq,
@@ -346,10 +405,85 @@ static void NewsBarApplyTextAnimated(const char *text)
     }
 
     if (s_news_marquee_label == NULL) {
+        s_news_marquee_pending = false;
+        s_news_marquee_start_ms = 0;
+        s_news_marquee_target = NULL;
+        s_news_marquee_target_end_x = NEWS_BAR_LABEL_X;
         lv_label_set_text(init_ui.screen_news_label, text);
         return;
     }
-    lv_label_set_text(s_news_marquee_label, text);
+
+    lv_obj_t *current_label = s_news_marquee_label;
+    lv_obj_t *next_label = s_news_marquee_label_back;
+    if (next_label == NULL) {
+        next_label = s_news_marquee_label;
+    }
+
+    lv_anim_del(current_label, NewsLabelAnimSetY);
+    lv_anim_del(current_label, NewsLabelAnimSetX);
+    if (next_label != current_label) {
+        lv_anim_del(next_label, NewsLabelAnimSetY);
+        lv_anim_del(next_label, NewsLabelAnimSetX);
+    }
+
+    const char *current_text = lv_label_get_text(current_label);
+    const bool has_current_text = (current_text != NULL) && (current_text[0] != '\0');
+    const bool is_same_text = (current_text != NULL) && (strcmp(current_text, text) == 0);
+    const bool do_slide = (next_label != current_label) && has_current_text && !is_same_text;
+
+    lv_label_set_long_mode(current_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_y(current_label, 0);
+    lv_obj_set_x(current_label, NEWS_BAR_LABEL_X);
+
+    lv_label_set_long_mode(next_label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(next_label, text);
+    lv_obj_set_y(next_label, do_slide ? NEWS_BAR_H : 0);
+    lv_obj_set_x(next_label, NEWS_BAR_LABEL_X);
+    const lv_coord_t text_w = NewsHeadlineTextWidthPx(next_label, text);
+    const lv_coord_t overflow_px = NewsHeadlineOverflowPx(text_w);
+    lv_obj_set_width(next_label, NEWS_BAR_LABEL_W + overflow_px);
+
+    if (do_slide) {
+        lv_anim_t out_anim;
+        lv_anim_init(&out_anim);
+        lv_anim_set_var(&out_anim, current_label);
+        lv_anim_set_exec_cb(&out_anim, NewsLabelAnimSetY);
+        lv_anim_set_values(&out_anim, 0, -NEWS_BAR_H);
+        lv_anim_set_time(&out_anim, NEWS_HEADLINE_SWITCH_ANIM_MS);
+        lv_anim_set_path_cb(&out_anim, lv_anim_path_ease_out);
+        lv_anim_start(&out_anim);
+
+        lv_anim_t in_anim;
+        lv_anim_init(&in_anim);
+        lv_anim_set_var(&in_anim, next_label);
+        lv_anim_set_exec_cb(&in_anim, NewsLabelAnimSetY);
+        lv_anim_set_values(&in_anim, NEWS_BAR_H, 0);
+        lv_anim_set_time(&in_anim, NEWS_HEADLINE_SWITCH_ANIM_MS);
+        lv_anim_set_path_cb(&in_anim, lv_anim_path_ease_out);
+        lv_anim_start(&in_anim);
+    } else if (next_label != current_label) {
+        lv_obj_set_y(current_label, -NEWS_BAR_H);
+        lv_obj_set_y(next_label, 0);
+    }
+
+    if (next_label != current_label) {
+        s_news_marquee_label = next_label;
+        s_news_marquee_label_back = current_label;
+    }
+
+    const bool need_marquee = overflow_px > 0;
+    if (need_marquee) {
+        s_news_marquee_pending = true;
+        s_news_marquee_target = s_news_marquee_label;
+        s_news_marquee_target_end_x = NEWS_BAR_LABEL_X - overflow_px;
+        s_news_marquee_start_ms =
+            NowMs() + NEWS_LONG_HEADLINE_MARQUEE_DELAY_MS + (do_slide ? NEWS_HEADLINE_SWITCH_ANIM_MS : 0);
+    } else {
+        s_news_marquee_pending = false;
+        s_news_marquee_start_ms = 0;
+        s_news_marquee_target = NULL;
+        s_news_marquee_target_end_x = NEWS_BAR_LABEL_X;
+    }
 }
 
 static void SetupNewsTickerAnimated(const lv_font_t *news_font)
@@ -380,36 +514,12 @@ static void SetupNewsTickerAnimated(const lv_font_t *news_font)
     lv_obj_move_foreground(s_news_anim_box);
 
     s_news_marquee_label = lv_label_create(s_news_anim_box);
-    lv_label_set_text(s_news_marquee_label, "");
-    lv_label_set_long_mode(s_news_marquee_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_size(s_news_marquee_label, NEWS_BAR_W - 12, NEWS_BAR_H);
-    lv_obj_set_pos(s_news_marquee_label, 6, 0);
-    lv_obj_set_style_border_width(s_news_marquee_label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(s_news_marquee_label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_color(s_news_marquee_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(s_news_marquee_label, news_font, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(s_news_marquee_label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_align(s_news_marquee_label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_letter_space(s_news_marquee_label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(s_news_marquee_label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_left(s_news_marquee_label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_right(s_news_marquee_label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_top(s_news_marquee_label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_bottom(s_news_marquee_label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_shadow_width(s_news_marquee_label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    SetupNewsHeadlineLabelStyle(s_news_marquee_label, news_font);
+    lv_obj_set_y(s_news_marquee_label, 0);
 
-    // Follow LVGL label docs: apply an animation template to control circular scroll cadence.
-    if (!s_news_anim_style_inited) {
-        lv_anim_init(&s_news_anim_template);
-        lv_anim_set_delay(&s_news_anim_template, 800);
-        lv_anim_set_repeat_delay(&s_news_anim_template, 1400);
-        lv_anim_set_repeat_count(&s_news_anim_template, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_time(&s_news_anim_template, 22000);
-        lv_style_init(&s_news_anim_style);
-        lv_style_set_anim(&s_news_anim_style, &s_news_anim_template);
-        s_news_anim_style_inited = true;
-    }
-    lv_obj_add_style(s_news_marquee_label, &s_news_anim_style, LV_PART_MAIN | LV_STATE_DEFAULT);
+    s_news_marquee_label_back = lv_label_create(s_news_anim_box);
+    SetupNewsHeadlineLabelStyle(s_news_marquee_label_back, news_font);
+    lv_obj_set_y(s_news_marquee_label_back, NEWS_BAR_H);
 }
 
 static bool FontHasGlyph(const lv_font_t *font, uint32_t codepoint)
@@ -564,20 +674,48 @@ void Lvgl_UserTask(void *arg) {
     int last_date_key = -1;
     int last_minute_key = -1;
     char lvgl_buffer[30] = {""};
+    int ui_last_battery_level = -101;
+    int ui_last_sensor_humidity = -1;
+    int ui_last_sensor_temperature = -1000;
+    char ui_last_hko_line[128] = {0};
     TickType_t last_wake_tick = xTaskGetTickCount();
     int64_t last_loop_start_ms = 0;
+    int64_t last_loop_gap_warn_ms = 0;
+    int64_t last_loop_body_warn_ms = 0;
 
     for(;;) {
         const int64_t loop_start_ms = NowMs();
         if (last_loop_start_ms != 0) {
             const int64_t loop_gap_ms = loop_start_ms - last_loop_start_ms;
-            if (loop_gap_ms >= UI_LOOP_GAP_WARN_MS) {
+            if ((loop_gap_ms >= UI_LOOP_GAP_WARN_MS) &&
+                ((loop_start_ms - last_loop_gap_warn_ms) >= UI_LOOP_GAP_LOG_INTERVAL_MS)) {
+                last_loop_gap_warn_ms = loop_start_ms;
                 ESP_LOGW(TAG, "UI loop gap=%lld ms (clock may freeze)", (long long)loop_gap_ms);
             }
         }
         last_loop_start_ms = loop_start_ms;
 
         bool need_refresh = false;
+        const bool time_valid = espwifi_is_time_synced();
+        time_t now_epoch = 0;
+        bool clock_needs_update = false;
+
+        if (!time_valid) {
+            clock_needs_update = (last_display_epoch != 0 || last_minute_key != -1 || last_date_key != -1);
+        } else {
+            time(&now_epoch);
+            clock_needs_update = (now_epoch != last_display_epoch);
+        }
+
+        const bool marquee_start_due =
+            s_news_marquee_pending && (loop_start_ms >= s_news_marquee_start_ms);
+        const bool has_pending_ui_work =
+            s_status_dirty || s_news_show || s_news_dirty || clock_needs_update || marquee_start_due;
+        if (!has_pending_ui_work) {
+            vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(CLOCK_POLL_MS));
+            continue;
+        }
+
         if (!TryLockLvgl()) {
             vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(CLOCK_POLL_MS));
             continue;
@@ -592,17 +730,20 @@ void Lvgl_UserTask(void *arg) {
             const int hko_temperature_c = s_hko_temperature_c;
             const char *hko_desc = (s_hko_desc[0] != '\0') ? s_hko_desc : "天氣";
 
-            if (battery_level >= 0) {
+            if ((battery_level >= 0) && (battery_level != ui_last_battery_level)) {
                 snprintf(lvgl_buffer,30,"%d%%",battery_level);
                 lv_label_set_text(init_ui.screen_label_7, lvgl_buffer);
+                ui_last_battery_level = battery_level;
             }
-            if (sensor_humidity_percent >= 0) {
+            if ((sensor_humidity_percent >= 0) && (sensor_humidity_percent != ui_last_sensor_humidity)) {
                 snprintf(lvgl_buffer,30,"%d%%",sensor_humidity_percent);
                 lv_label_set_text(init_ui.screen_label_11, lvgl_buffer);
+                ui_last_sensor_humidity = sensor_humidity_percent;
             }
-            if (sensor_temperature_c > -1000) {
+            if ((sensor_temperature_c > -1000) && (sensor_temperature_c != ui_last_sensor_temperature)) {
                 snprintf(lvgl_buffer,30,"%d°",sensor_temperature_c);
                 lv_label_set_text(init_ui.screen_label_12, lvgl_buffer);
+                ui_last_sensor_temperature = sensor_temperature_c;
             }
 
             {
@@ -625,14 +766,13 @@ void Lvgl_UserTask(void *arg) {
                     hko_temp_str,
                     hko_humi_str
                 );
-                if (s_hko_label != NULL) {
-                    lv_label_set_text(s_hko_label, env_line);
-                    if (s_hko_bar != NULL) {
-                        lv_obj_move_foreground(s_hko_bar);
+                if (strcmp(ui_last_hko_line, env_line) != 0) {
+                    if (s_hko_label != NULL) {
+                        lv_label_set_text(s_hko_label, env_line);
+                    } else {
+                        lv_label_set_text(init_ui.screen_label_8, env_line);
                     }
-                } else {
-                    lv_label_set_text(init_ui.screen_label_8, env_line);
-                    lv_obj_move_foreground(init_ui.screen_label_8);
+                    strlcpy(ui_last_hko_line, env_line, sizeof(ui_last_hko_line));
                 }
             }
         }
@@ -644,8 +784,6 @@ void Lvgl_UserTask(void *arg) {
             static const char * const weekday_zh[] = {
                 "週日","週一","週二","週三","週四","週五","週六"
             };
-            const bool time_valid = espwifi_is_time_synced();
-
             if (!time_valid) {
                 if (last_display_epoch != 0 || last_minute_key != -1 || last_date_key != -1) {
                     last_display_epoch = 0;
@@ -659,10 +797,6 @@ void Lvgl_UserTask(void *arg) {
                 }
             } else {
                 struct tm display_tm = {0};
-                time_t now_epoch = 0;
-
-                time(&now_epoch);
-
                 if (now_epoch != last_display_epoch) {
                     last_display_epoch = now_epoch;
                     localtime_r(&now_epoch, &display_tm);
@@ -710,7 +844,38 @@ void Lvgl_UserTask(void *arg) {
         if (s_news_dirty) {
             s_news_dirty = false;
             NewsBarApplyTextAnimated(s_news_buf);
-            ESP_LOGI(TAG, "NEWS apply #%lu text=\"%.64s\"", (unsigned long)s_news_post_seq, s_news_buf);
+            ESP_LOGD(TAG, "NEWS apply #%lu text=\"%.64s\"", (unsigned long)s_news_post_seq, s_news_buf);
+        }
+        if (s_news_marquee_pending && (NowMs() >= s_news_marquee_start_ms)) {
+            s_news_marquee_pending = false;
+            s_news_marquee_start_ms = 0;
+            lv_obj_t *target = s_news_marquee_target;
+            const lv_coord_t end_x = s_news_marquee_target_end_x;
+            s_news_marquee_target = NULL;
+            s_news_marquee_target_end_x = NEWS_BAR_LABEL_X;
+
+            if ((target != NULL) && (end_x < NEWS_BAR_LABEL_X)) {
+                lv_anim_del(target, NewsLabelAnimSetX);
+                lv_obj_set_x(target, NEWS_BAR_LABEL_X);
+
+                const int32_t distance_px = (int32_t)(NEWS_BAR_LABEL_X - end_x);
+                uint32_t duration_ms =
+                    (uint32_t)(((int64_t)distance_px * 1000 + NEWS_LONG_HEADLINE_MARQUEE_SPEED_PX_S - 1)
+                    / NEWS_LONG_HEADLINE_MARQUEE_SPEED_PX_S);
+                if (duration_ms < 200) {
+                    duration_ms = 200;
+                }
+
+                lv_anim_t marquee_anim;
+                lv_anim_init(&marquee_anim);
+                lv_anim_set_var(&marquee_anim, target);
+                lv_anim_set_exec_cb(&marquee_anim, NewsLabelAnimSetX);
+                lv_anim_set_values(&marquee_anim, NEWS_BAR_LABEL_X, end_x);
+                lv_anim_set_time(&marquee_anim, duration_ms);
+                lv_anim_set_path_cb(&marquee_anim, lv_anim_path_linear);
+                lv_anim_start(&marquee_anim);
+                need_refresh = true;
+            }
         }
 
         Lvgl_unlock();
@@ -719,7 +884,10 @@ void Lvgl_UserTask(void *arg) {
         }
 
         const int64_t loop_body_ms = NowMs() - loop_start_ms;
-        if (loop_body_ms >= UI_LOOP_BODY_WARN_MS) {
+        const int64_t now_ms = NowMs();
+        if ((loop_body_ms >= UI_LOOP_BODY_WARN_MS) &&
+            ((now_ms - last_loop_body_warn_ms) >= UI_LOOP_BODY_LOG_INTERVAL_MS)) {
+            last_loop_body_warn_ms = now_ms;
             ESP_LOGW(TAG, "UI loop body took %lld ms", (long long)loop_body_ms);
         }
         vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(CLOCK_POLL_MS));
@@ -737,9 +905,12 @@ void Status_PollTask(void *arg) {
         if ((int32_t)(now_tick - next_adc_tick) >= 0) {
             next_adc_tick = now_tick + pdMS_TO_TICKS(BATTERY_INTERVAL_MS);
             const int64_t t_start_ms = NowMs();
-            s_battery_level = (int)Adc_GetBatteryLevel();
+            const int battery_level = (int)Adc_GetBatteryLevel();
             LogBlockingMs("Adc_GetBatteryLevel", NowMs() - t_start_ms, ADC_BLOCK_WARN_MS, false);
-            s_status_dirty = true;
+            if (s_battery_level != battery_level) {
+                s_battery_level = battery_level;
+                s_status_dirty = true;
+            }
         }
 
         if ((int32_t)(now_tick - next_sensor_tick) >= 0) {
@@ -969,6 +1140,7 @@ void Codec_LoopTask(void *arg) {
 void News_TickerTask(void *arg) {
     const TickType_t refresh_ticks = pdMS_TO_TICKS(NEWS_REFRESH_INTERVAL_MS);
     const TickType_t retry_ticks = pdMS_TO_TICKS(NEWS_RETRY_INTERVAL_MS);
+    const TickType_t rotate_ticks = pdMS_TO_TICKS(NEWS_HEADLINE_ROTATE_MS);
 
     auto periodic_fetch_news = []() -> bool {
         ESP_LOGI(TAG, "News periodic refresh: start");
@@ -1018,12 +1190,12 @@ void News_TickerTask(void *arg) {
     }
 
     TickType_t next_refresh_tick = xTaskGetTickCount() + ((news_service_count() > 0) ? refresh_ticks : 0);
-    size_t used_items = 0;
-    char *ticker_text = BuildNewsTickerText(&used_items);
-    ESP_LOGI(TAG, "NEWS ticker boot rss_cnt=%u ticker_items=%u", (unsigned int)news_service_count(), (unsigned int)used_items);
-    if ((ticker_text != NULL) && (used_items > 0)) {
-        PostNewsText(ticker_text, "boot_apply", 0, used_items);
-        free(ticker_text);
+    TickType_t next_rotate_tick = xTaskGetTickCount();
+    size_t rotate_idx = 0;
+    const size_t boot_cnt = news_service_count();
+    ESP_LOGI(TAG, "NEWS ticker boot rss_cnt=%u", (unsigned int)boot_cnt);
+    if ((boot_cnt > 0) && PostNewsHeadlineByIndex(rotate_idx, "boot_apply")) {
+        next_rotate_tick = xTaskGetTickCount() + rotate_ticks;
     } else {
         PostNewsText("無法取得新聞（稍後會自動重試）", "boot_empty", 0, 0);
     }
@@ -1035,11 +1207,11 @@ void News_TickerTask(void *arg) {
 
             const bool refreshed = periodic_fetch_news();
             const size_t new_cnt = news_service_count();
-            ticker_text = BuildNewsTickerText(&used_items);
-            ESP_LOGI(TAG, "NEWS ticker refresh rss_cnt=%u ticker_items=%u", (unsigned int)new_cnt, (unsigned int)used_items);
-            if ((ticker_text != NULL) && (used_items > 0)) {
-                PostNewsText(ticker_text, "refresh_apply", 0, used_items);
-                free(ticker_text);
+            ESP_LOGI(TAG, "NEWS ticker refresh rss_cnt=%u", (unsigned int)new_cnt);
+            if (new_cnt > 0) {
+                rotate_idx = 0;
+                PostNewsHeadlineByIndex(rotate_idx, "refresh_apply");
+                next_rotate_tick = xTaskGetTickCount() + rotate_ticks;
             } else {
                 PostNewsText("無法取得新聞（稍後會自動重試）", "refresh_empty", 0, new_cnt);
             }
@@ -1051,6 +1223,18 @@ void News_TickerTask(void *arg) {
                 (unsigned int)new_cnt,
                 (unsigned long)(refreshed ? NEWS_REFRESH_INTERVAL_MS : NEWS_RETRY_INTERVAL_MS)
             );
+        }
+
+        now_tick = xTaskGetTickCount();
+        const size_t cnt = news_service_count();
+        if ((cnt > 1) && ((int32_t)(now_tick - next_rotate_tick) >= 0)) {
+            rotate_idx = (rotate_idx + 1) % cnt;
+            if (PostNewsHeadlineByIndex(rotate_idx, "rotate")) {
+                next_rotate_tick = now_tick + rotate_ticks;
+            } else {
+                rotate_idx = 0;
+                next_rotate_tick = now_tick + pdMS_TO_TICKS(1000);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(NEWS_LOOP_SLEEP_MS));
     }
@@ -1239,7 +1423,7 @@ void UserApp_UiInit() {
     lv_label_set_text(s_hko_label, "天氣 -° -%");
     lv_obj_move_foreground(s_hko_bar);
 
-    // News ticker: one-line marquee (right-to-left) in a dedicated bottom bar.
+    // News ticker: rotate headlines one-by-one in a dedicated bottom bar.
     SetupNewsTickerAnimated(news_font);
 
     // Hide unrelated status/test labels on the clock page.
@@ -1254,12 +1438,13 @@ void UserApp_UiInit() {
 }
 
 void UserApp_TaskInit() {
-    xTaskCreatePinnedToCore(Lvgl_Cont1Task, "Lvgl_Cont1Task", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(Lvgl_UserTask, "Lvgl_UserTask", 5 * 1024, NULL, 4, NULL,1);
-    xTaskCreatePinnedToCore(Status_PollTask, "Status_PollTask", 4 * 1024, NULL, 1, NULL,1);
-    xTaskCreatePinnedToCore(Lvgl_WfifBleScanTask, "Lvgl_WfifBleScanTask", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(BOOT_LoopTask, "BOOT_LoopTask", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(KEY_LoopTask, "KEY_LoopTask", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(Codec_LoopTask,   "Codec_LoopTask",   4 * 1024, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(News_TickerTask,  "News_TickerTask",  4 * 1024, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(Lvgl_Cont1Task, "Lvgl_Cont1Task", 4 * 1024, NULL, 2, NULL, UI_TASK_CORE_ID);
+    xTaskCreatePinnedToCore(Lvgl_UserTask, "Lvgl_UserTask", 5 * 1024, NULL, 4, NULL, UI_TASK_CORE_ID);
+
+    xTaskCreatePinnedToCore(Status_PollTask, "Status_PollTask", 4 * 1024, NULL, 1, NULL, BG_TASK_CORE_ID);
+    xTaskCreatePinnedToCore(Lvgl_WfifBleScanTask, "Lvgl_WfifBleScanTask", 4 * 1024, NULL, 2, NULL, BG_TASK_CORE_ID);
+    xTaskCreatePinnedToCore(BOOT_LoopTask, "BOOT_LoopTask", 4 * 1024, NULL, 2, NULL, BG_TASK_CORE_ID);
+    xTaskCreatePinnedToCore(KEY_LoopTask, "KEY_LoopTask", 4 * 1024, NULL, 2, NULL, BG_TASK_CORE_ID);
+    xTaskCreatePinnedToCore(Codec_LoopTask, "Codec_LoopTask", 4 * 1024, NULL, 2, NULL, BG_TASK_CORE_ID);
+    xTaskCreatePinnedToCore(News_TickerTask, "News_TickerTask", 4 * 1024, NULL, 1, NULL, BG_TASK_CORE_ID);
 }

@@ -11,6 +11,8 @@
 #define BUF_INIT_SIZE  (32 * 1024)
 #define BUF_MAX_SIZE   (256 * 1024)
 #define NEWS_INIT_CAP 16
+#define HTTP_RX_BUF_SIZE 2048
+#define HTTP_TX_BUF_SIZE 512
 
 static char  **s_titles = NULL;
 static size_t  s_count = 0;
@@ -235,8 +237,8 @@ void news_service_fetch(void)
         .event_handler    = http_event_cb,
         .timeout_ms       = 15000,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size      = 4096,
-        .buffer_size_tx   = 1024,
+        .buffer_size      = HTTP_RX_BUF_SIZE,
+        .buffer_size_tx   = HTTP_TX_BUF_SIZE,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
@@ -268,6 +270,13 @@ void news_service_fetch(void)
     } else {
         ESP_LOGE(TAG, "HTTP error: %s", esp_err_to_name(err));
         log_heap_state("http_error");
+        if (s_buf_len > 0) {
+            /* Even when TLS/HTTP ends with an error, the partial payload often still has usable headlines. */
+            s_buf[s_buf_len] = '\0';
+            ESP_LOGW(TAG, "Try partial RSS parse from %d bytes after HTTP error", s_buf_len);
+            parse_rss();
+            ESP_LOGW(TAG, "Partial parse recovered %u headline(s)", (unsigned int)s_count);
+        }
     }
 
     esp_http_client_cleanup(client);

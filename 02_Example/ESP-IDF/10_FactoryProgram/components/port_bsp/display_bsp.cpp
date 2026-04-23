@@ -2,7 +2,14 @@
 #include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include "display_bsp.h"
+
+static const int RLCD_SPI_CLOCK_HZ = 20 * 1000 * 1000;
+static const int RLCD_TX_QUEUE_DEPTH = 1;
+static const int RLCD_TX_RETRY_MAX = 2;
+static const int RLCD_TX_RETRY_DELAY_MS = 2;
+static const int RLCD_TX_DMA_CANDIDATE_SIZES[] = {4096, 3072, 2048, 1024};
 
 DisplayPort::DisplayPort(int mosi, int scl, int dc, int cs, int rst, int width, int height, spi_host_device_t spihost) : 
 mosi_(mosi), 
@@ -28,12 +35,13 @@ height_(height)
     esp_lcd_panel_io_spi_config_t io_config = {};
     io_config.dc_gpio_num = dc_;
     io_config.cs_gpio_num = cs_;
-    io_config.pclk_hz = 10 * 1000 * 1000;
+    io_config.pclk_hz = RLCD_SPI_CLOCK_HZ;
     io_config.lcd_cmd_bits = 8;
     io_config.lcd_param_bits = 8;
     io_config.spi_mode = 0;
-    io_config.trans_queue_depth = 10;
+    io_config.trans_queue_depth = RLCD_TX_QUEUE_DEPTH;
 
+    ESP_LOGI(TAG, "RLCD SPI clock: %d Hz queue_depth=%d", RLCD_SPI_CLOCK_HZ, RLCD_TX_QUEUE_DEPTH);
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)spihost, &io_config, &io_handle));
 
     gpio_config_t gpio_conf = {};
@@ -50,6 +58,26 @@ height_(height)
     DispBuffer                = (uint8_t *) heap_caps_malloc(DisplayLen, MALLOC_CAP_SPIRAM);
     assert(DispBuffer);
 
+    for (size_t i = 0; i < sizeof(RLCD_TX_DMA_CANDIDATE_SIZES) / sizeof(RLCD_TX_DMA_CANDIDATE_SIZES[0]); i++) {
+        int candidate_size = RLCD_TX_DMA_CANDIDATE_SIZES[i];
+        if (candidate_size > DisplayLen) {
+            candidate_size = DisplayLen;
+        }
+        if (candidate_size < 512) {
+            continue;
+        }
+        TxDmaBuffer = (uint8_t *) heap_caps_malloc(candidate_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (TxDmaBuffer != NULL) {
+            TxDmaBufferSize = candidate_size;
+            break;
+        }
+    }
+    if (TxDmaBuffer != NULL) {
+        ESP_LOGI(TAG, "RLCD DMA staging: %d bytes", TxDmaBufferSize);
+    } else {
+        ESP_LOGW(TAG, "RLCD DMA staging unavailable, fallback to direct tx");
+    }
+
 #if (AlgorithmOptimization == 3)
 	PixelIndexLUT = (uint16_t (*)[300])heap_caps_malloc(transfer * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
 	PixelBitLUT   = (uint8_t (*)[300])heap_caps_malloc(transfer * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
@@ -64,6 +92,25 @@ height_(height)
 }
 
 DisplayPort::~DisplayPort() {
+    if (TxDmaBuffer != NULL) {
+        heap_caps_free(TxDmaBuffer);
+        TxDmaBuffer = NULL;
+        TxDmaBufferSize = 0;
+    }
+    if (DispBuffer != NULL) {
+        heap_caps_free(DispBuffer);
+        DispBuffer = NULL;
+    }
+#if (AlgorithmOptimization == 3)
+    if (PixelIndexLUT != NULL) {
+        heap_caps_free(PixelIndexLUT);
+        PixelIndexLUT = NULL;
+    }
+    if (PixelBitLUT != NULL) {
+        heap_caps_free(PixelBitLUT);
+        PixelBitLUT = NULL;
+    }
+#endif
 }
 
 void DisplayPort::RLCD_Init() {
@@ -219,7 +266,57 @@ void DisplayPort::RLCD_SendData(uint8_t Data) {
 }
 
 void DisplayPort::RLCD_Sendbuffera(uint8_t *Data, int len) {
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, -1, Data, len));
+    if ((Data == NULL) || (len <= 0)) {
+        return;
+    }
+
+    if ((TxDmaBuffer == NULL) || (TxDmaBufferSize <= 0)) {
+        esp_err_t ret = esp_lcd_panel_io_tx_color(io_handle, -1, Data, len);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "direct tx failed err=%s len=%d", esp_err_to_name(ret), len);
+        }
+        return;
+    }
+
+    int offset = 0;
+    while (offset < len) {
+        if (offset > 0) {
+            esp_err_t wait_ret = esp_lcd_panel_io_tx_param(io_handle, -1, NULL, 0);
+            if (wait_ret != ESP_OK) {
+                ESP_LOGE(TAG, "tx drain failed err=%s", esp_err_to_name(wait_ret));
+                return;
+            }
+        }
+
+        int chunk = len - offset;
+        if (chunk > TxDmaBufferSize) {
+            chunk = TxDmaBufferSize;
+        }
+        memcpy(TxDmaBuffer, Data + offset, chunk);
+
+        esp_err_t ret = ESP_FAIL;
+        for (int retry = 0; retry <= RLCD_TX_RETRY_MAX; retry++) {
+            ret = esp_lcd_panel_io_tx_color(io_handle, -1, TxDmaBuffer, chunk);
+            if (ret == ESP_OK) {
+                break;
+            }
+            if ((ret != ESP_ERR_NO_MEM) && (ret != ESP_ERR_TIMEOUT)) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(RLCD_TX_RETRY_DELAY_MS));
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "tx failed err=%s offset=%d chunk=%d", esp_err_to_name(ret), offset, chunk);
+            return;
+        }
+
+        offset += chunk;
+    }
+
+    esp_err_t wait_ret = esp_lcd_panel_io_tx_param(io_handle, -1, NULL, 0);
+    if (wait_ret != ESP_OK) {
+        ESP_LOGE(TAG, "tx final drain failed err=%s", esp_err_to_name(wait_ret));
+    }
 }
 
 void DisplayPort::Set_ResetIOLevel(uint8_t level) {

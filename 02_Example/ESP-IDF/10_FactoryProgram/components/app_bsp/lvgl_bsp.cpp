@@ -11,7 +11,10 @@ static SemaphoreHandle_t lvgl_mux = NULL;
 static TaskHandle_t lvgl_task_handle = NULL;
 
 static const char *TAG = "LvglPort";
-static const int64_t LVGL_HANDLER_WARN_MS = 80;
+static const int64_t LVGL_HANDLER_WARN_MS = 220;
+static const int64_t LVGL_HANDLER_WARN_RATE_LIMIT_MS = 2000;
+static int64_t s_last_handler_warn_ms = 0;
+static const BaseType_t LVGL_TASK_CORE_ID = 1;
 
 static void Increase_lvgl_tick(void *arg)
 {
@@ -47,7 +50,10 @@ static void Lvgl_port_task(void *arg)
             const int64_t handler_start_us = esp_timer_get_time();
   	  	  	task_delay_ms = lv_timer_handler();
             const int64_t handler_dur_ms = (esp_timer_get_time() - handler_start_us) / 1000;
-            if (handler_dur_ms >= LVGL_HANDLER_WARN_MS) {
+            const int64_t now_ms = handler_start_us / 1000;
+            if ((handler_dur_ms >= LVGL_HANDLER_WARN_MS) &&
+                ((now_ms - s_last_handler_warn_ms) >= LVGL_HANDLER_WARN_RATE_LIMIT_MS)) {
+                s_last_handler_warn_ms = now_ms;
                 ESP_LOGW(TAG, "lv_timer_handler blocked %lld ms", (long long)handler_dur_ms);
             }
   	  	  	//Release the mutex
@@ -93,5 +99,6 @@ void Lvgl_PortInit(int width, int height,DispFlushCb flush_cb) {
   	ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
   	ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer,LVGL_TICK_PERIOD_MS * 1000));
 
-    xTaskCreatePinnedToCore(Lvgl_port_task, "LVGL", 8 * 1024, NULL, 5, &lvgl_task_handle, 0);
+    ESP_LOGI(TAG, "Create LVGL task on core %ld", (long)LVGL_TASK_CORE_ID);
+    xTaskCreatePinnedToCore(Lvgl_port_task, "LVGL", 8 * 1024, NULL, 5, &lvgl_task_handle, LVGL_TASK_CORE_ID);
 }

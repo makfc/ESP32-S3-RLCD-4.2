@@ -28,6 +28,8 @@ private:
     int                 width_;
     int                 height_;
     uint8_t            *DispBuffer = NULL;
+    uint8_t            *TxDmaBuffer = NULL;
+    int                 TxDmaBufferSize = 0;
     int                 DisplayLen;
 #if (AlgorithmOptimization == 3)
 	uint16_t (*PixelIndexLUT)[300];
