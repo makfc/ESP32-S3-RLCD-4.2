@@ -172,7 +172,7 @@ static void SetupNewsHeadlineLabelStyle(lv_obj_t *label, const lv_font_t *news_f
     lv_obj_set_x(label, NEWS_BAR_LABEL_X);
     lv_obj_set_style_border_width(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_radius(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(label, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(label, news_font, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -672,7 +672,7 @@ static void SetupNewsTickerAnimated(const lv_font_t *news_font)
     lv_obj_clear_flag(s_news_anim_box, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(s_news_anim_box, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_bg_opa(s_news_anim_box, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(s_news_anim_box, lv_color_hex(0x1a3a5c), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_news_anim_box, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_radius(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_shadow_width(s_news_anim_box, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
