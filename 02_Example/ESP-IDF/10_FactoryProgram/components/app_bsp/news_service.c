@@ -1,6 +1,9 @@
 #include "news_service.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <time.h>
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -15,6 +18,7 @@
 #define HTTP_TX_BUF_SIZE 512
 
 static char  **s_titles = NULL;
+static time_t *s_pub_epochs = NULL;
 static size_t  s_count = 0;
 static size_t  s_cap = 0;
 
@@ -49,7 +53,11 @@ static void clear_titles(void)
         }
         free(s_titles);
     }
+    if (s_pub_epochs != NULL) {
+        free(s_pub_epochs);
+    }
     s_titles = NULL;
+    s_pub_epochs = NULL;
     s_count = 0;
     s_cap = 0;
 }
@@ -63,11 +71,29 @@ static bool reserve_titles(size_t need_cap)
     while (new_cap < need_cap) {
         new_cap *= 2;
     }
-    char **new_arr = (char **)realloc(s_titles, new_cap * sizeof(char *));
-    if (new_arr == NULL) {
+    char **new_titles = (char **)malloc(new_cap * sizeof(char *));
+    if (new_titles == NULL) {
         return false;
     }
-    s_titles = new_arr;
+    time_t *new_pub_epochs = (time_t *)malloc(new_cap * sizeof(time_t));
+    if (new_pub_epochs == NULL) {
+        free(new_titles);
+        return false;
+    }
+
+    memset(new_titles, 0, new_cap * sizeof(char *));
+    memset(new_pub_epochs, 0, new_cap * sizeof(time_t));
+    if ((s_titles != NULL) && (s_count > 0)) {
+        memcpy(new_titles, s_titles, s_count * sizeof(char *));
+    }
+    if ((s_pub_epochs != NULL) && (s_count > 0)) {
+        memcpy(new_pub_epochs, s_pub_epochs, s_count * sizeof(time_t));
+    }
+
+    free(s_titles);
+    free(s_pub_epochs);
+    s_titles = new_titles;
+    s_pub_epochs = new_pub_epochs;
     s_cap = new_cap;
     return true;
 }
@@ -154,7 +180,108 @@ static void decode_entities(char *s)
     *w = '\0';
 }
 
-static bool add_title(const char *start, size_t len, bool need_decode)
+static bool is_leap_year(int year)
+{
+    return ((year % 4 == 0) && (year % 100 != 0)) || (year % 400 == 0);
+}
+
+static int days_in_month(int year, int month)
+{
+    static const int k_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if ((month < 1) || (month > 12)) {
+        return 0;
+    }
+    if ((month == 2) && is_leap_year(year)) {
+        return 29;
+    }
+    return k_days[month - 1];
+}
+
+static int month_from_abbr(const char *abbr)
+{
+    if (abbr == NULL) {
+        return -1;
+    }
+    if (strncmp(abbr, "Jan", 3) == 0) return 1;
+    if (strncmp(abbr, "Feb", 3) == 0) return 2;
+    if (strncmp(abbr, "Mar", 3) == 0) return 3;
+    if (strncmp(abbr, "Apr", 3) == 0) return 4;
+    if (strncmp(abbr, "May", 3) == 0) return 5;
+    if (strncmp(abbr, "Jun", 3) == 0) return 6;
+    if (strncmp(abbr, "Jul", 3) == 0) return 7;
+    if (strncmp(abbr, "Aug", 3) == 0) return 8;
+    if (strncmp(abbr, "Sep", 3) == 0) return 9;
+    if (strncmp(abbr, "Oct", 3) == 0) return 10;
+    if (strncmp(abbr, "Nov", 3) == 0) return 11;
+    if (strncmp(abbr, "Dec", 3) == 0) return 12;
+    return -1;
+}
+
+static int64_t days_from_civil(int year, unsigned month, unsigned day)
+{
+    year -= (month <= 2);
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = (unsigned)(year - era * 400);
+    const unsigned doy = (153U * (month + (month > 2 ? (unsigned)-3 : 9U)) + 2U) / 5U + day - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
+}
+
+static bool parse_pubdate_to_epoch(const char *pub_date, time_t *out_epoch)
+{
+    if ((pub_date == NULL) || (out_epoch == NULL)) {
+        return false;
+    }
+
+    char wday[8] = {0};
+    char mon[8] = {0};
+    char tz[8] = {0};
+    int day = 0;
+    int year = 0;
+    int hour = 0;
+    int min = 0;
+    int sec = 0;
+
+    const int matched = sscanf(
+        pub_date,
+        "%7[^,], %d %7s %d %d:%d:%d %7s",
+        wday,
+        &day,
+        mon,
+        &year,
+        &hour,
+        &min,
+        &sec,
+        tz
+    );
+    if (matched != 8) {
+        return false;
+    }
+
+    const int month = month_from_abbr(mon);
+    if (month < 1) {
+        return false;
+    }
+    if ((day < 1) || (day > days_in_month(year, month))) {
+        return false;
+    }
+    if ((hour < 0) || (hour > 23) || (min < 0) || (min > 59) || (sec < 0) || (sec > 60)) {
+        return false;
+    }
+    if ((strcmp(tz, "GMT") != 0) && (strcmp(tz, "UTC") != 0) && (strcmp(tz, "+0000") != 0)) {
+        return false;
+    }
+
+    const int64_t days = days_from_civil(year, (unsigned)month, (unsigned)day);
+    const int64_t epoch = days * 86400LL + (int64_t)hour * 3600LL + (int64_t)min * 60LL + (int64_t)sec;
+    if (epoch < 0) {
+        return false;
+    }
+    *out_epoch = (time_t)epoch;
+    return true;
+}
+
+static bool add_title(const char *start, size_t len, bool need_decode, time_t pub_epoch)
 {
     if (start == NULL) {
         return false;
@@ -180,7 +307,14 @@ static bool add_title(const char *start, size_t len, bool need_decode)
     }
 
     s_titles[s_count] = title;
-    ESP_LOGI(TAG, "[%u] %s", (unsigned int)s_count, s_titles[s_count]);
+    s_pub_epochs[s_count] = pub_epoch;
+    ESP_LOGI(
+        TAG,
+        "[%u] %s (pub_epoch=%lld)",
+        (unsigned int)s_count,
+        s_titles[s_count],
+        (long long)s_pub_epochs[s_count]
+    );
     s_count++;
     return true;
 }
@@ -209,8 +343,27 @@ static void parse_rss(void)
         }
         if (!te || te > item_end) { ptr = item_end + 7; continue; }
 
+        time_t pub_epoch = 0;
+        char *pub_s = strstr(item, "<pubDate>");
+        if ((pub_s != NULL) && (pub_s < item_end)) {
+            pub_s += 9;
+            char *pub_e = strstr(pub_s, "</pubDate>");
+            if ((pub_e != NULL) && (pub_e <= item_end)) {
+                char pub_buf[64] = {0};
+                size_t pub_len = (size_t)(pub_e - pub_s);
+                if (pub_len >= sizeof(pub_buf)) {
+                    pub_len = sizeof(pub_buf) - 1;
+                }
+                memcpy(pub_buf, pub_s, pub_len);
+                pub_buf[pub_len] = '\0';
+                if (!parse_pubdate_to_epoch(pub_buf, &pub_epoch)) {
+                    ESP_LOGW(TAG, "pubDate parse failed: %s", pub_buf);
+                }
+            }
+        }
+
         const size_t len = (size_t)(te - ts);
-        if (!add_title(ts, len, !cdata)) {
+        if (!add_title(ts, len, !cdata, pub_epoch)) {
             break;
         }
         ptr = item_end + 7;
@@ -294,5 +447,62 @@ bool news_service_get(size_t idx, char *buf, size_t len)
 {
     if (idx >= s_count) return false;
     strlcpy(buf, s_titles[idx], len);
+    return true;
+}
+
+bool news_service_get_relative_age(size_t idx, char *buf, size_t len)
+{
+    if ((buf == NULL) || (len == 0) || (idx >= s_count)) {
+        return false;
+    }
+    buf[0] = '\0';
+
+    const time_t pub_epoch = s_pub_epochs[idx];
+    if (pub_epoch <= 0) {
+        return false;
+    }
+
+    time_t now = 0;
+    time(&now);
+    if (now <= 0) {
+        return false;
+    }
+
+    int64_t age_sec = (int64_t)now - (int64_t)pub_epoch;
+    if (age_sec < 0) {
+        age_sec = 0;
+    }
+
+    if (age_sec < 60) {
+        strlcpy(buf, "剛剛", len);
+        return true;
+    }
+
+    if (age_sec < 3600) {
+        const int mins = (int)(age_sec / 60);
+        snprintf(buf, len, "%d分鐘前", mins);
+        return true;
+    }
+
+    if (age_sec < 86400) {
+        const int hours = (int)(age_sec / 3600);
+        if (hours == 1) {
+            strlcpy(buf, "一小時前", len);
+        } else if (hours == 2) {
+            strlcpy(buf, "兩小時前", len);
+        } else {
+            snprintf(buf, len, "%d小時前", hours);
+        }
+        return true;
+    }
+
+    const int days = (int)(age_sec / 86400);
+    if (days == 1) {
+        strlcpy(buf, "一天前", len);
+    } else if (days == 2) {
+        strlcpy(buf, "兩天前", len);
+    } else {
+        snprintf(buf, len, "%d天前", days);
+    }
     return true;
 }

@@ -425,17 +425,42 @@ static bool EnsureNewsNextBuffer(size_t need_len)
     return true;
 }
 
+static size_t NewsTickerSourceCount(void)
+{
+    return news_service_count() + weather_service_warn_count();
+}
+
 static bool PostNewsHeadlineByIndex(size_t idx, const char *reason)
 {
     char title[NEWS_TITLE_LEN] = {0};
-    const size_t cnt = news_service_count();
+    char age_text[24] = {0};
+    char display_text[NEWS_TITLE_LEN + 48] = {0};
+    char warn_display[NEWS_TITLE_LEN * 4] = {0};
+    const size_t warn_cnt = weather_service_warn_count();
+    const size_t news_cnt = news_service_count();
+    const size_t cnt = warn_cnt + news_cnt;
     if (cnt == 0 || idx >= cnt) {
         return false;
     }
-    if (!news_service_get(idx, title, sizeof(title)) || title[0] == '\0') {
+
+    if (idx < warn_cnt) {
+        if (!weather_service_warn_get_display(idx, warn_display, sizeof(warn_display)) || warn_display[0] == '\0') {
+            return false;
+        }
+        PostNewsText(warn_display, reason, idx + 1, cnt);
+        return true;
+    }
+
+    const size_t news_idx = idx - warn_cnt;
+    if (!news_service_get(news_idx, title, sizeof(title)) || title[0] == '\0') {
         return false;
     }
-    PostNewsText(title, reason, idx + 1, cnt);
+    if (news_service_get_relative_age(news_idx, age_text, sizeof(age_text)) && age_text[0] != '\0') {
+        snprintf(display_text, sizeof(display_text), "%s（%s）", title, age_text);
+        PostNewsText(display_text, reason, idx + 1, cnt);
+    } else {
+        PostNewsText(title, reason, idx + 1, cnt);
+    }
     return true;
 }
 
@@ -1294,15 +1319,24 @@ void News_TickerTask(void *arg) {
             t_start_ms = NowMs();
             news_service_fetch();
             LogBlockingMs("news_service_fetch", NowMs() - t_start_ms, NEWS_STEP_WARN_MS, true);
-            ok = news_service_count() > 0;
-            ESP_LOGI(TAG, "News periodic refresh: got %u item(s)", (unsigned int)news_service_count());
+            const size_t rss_cnt = news_service_count();
+            ESP_LOGI(TAG, "News periodic refresh: rss got %u item(s)", (unsigned int)rss_cnt);
 
             t_start_ms = NowMs();
             const bool weather_ok = weather_service_fetch();
             LogBlockingMs("weather_service_fetch", NowMs() - t_start_ms, NEWS_STEP_WARN_MS, true);
+            const size_t warn_cnt = weather_service_warn_count();
             if (weather_ok) {
                 ApplyWeatherSnapshot("periodic");
             }
+            const size_t total_cnt = rss_cnt + warn_cnt;
+            ok = total_cnt > 0;
+            ESP_LOGI(
+                TAG,
+                "News periodic refresh: warn=%u total_source=%u",
+                (unsigned int)warn_cnt,
+                (unsigned int)total_cnt
+            );
         } else {
             ESP_LOGW(TAG, "News periodic refresh: no IP");
         }
@@ -1321,10 +1355,10 @@ void News_TickerTask(void *arg) {
     ESP_LOGI(TAG, "NEWS ticker: main screen ready, waiting headline data");
 
     /* Ticker should only start after we have at least one fetched headline. */
-    while (news_service_count() == 0) {
+    while (NewsTickerSourceCount() == 0) {
         ESP_LOGW(TAG, "NEWS ticker: no headline yet, retry fetch");
         (void)periodic_fetch_news();
-        if (news_service_count() == 0) {
+        if (NewsTickerSourceCount() == 0) {
             vTaskDelay(retry_ticks);
         }
     }
@@ -1334,8 +1368,8 @@ void News_TickerTask(void *arg) {
     TickType_t next_refresh_tick = xTaskGetTickCount() + refresh_ticks;
     TickType_t next_rotate_tick = xTaskGetTickCount();
     size_t rotate_idx = 0;
-    const size_t boot_cnt = news_service_count();
-    ESP_LOGI(TAG, "NEWS ticker boot rss_cnt=%u", (unsigned int)boot_cnt);
+    const size_t boot_cnt = NewsTickerSourceCount();
+    ESP_LOGI(TAG, "NEWS ticker boot source_cnt=%u", (unsigned int)boot_cnt);
     if ((boot_cnt > 0) && PostNewsHeadlineByIndex(rotate_idx, "boot_apply")) {
         next_rotate_tick = xTaskGetTickCount() + rotate_ticks;
     } else {
@@ -1345,11 +1379,11 @@ void News_TickerTask(void *arg) {
     for (;;) {
         TickType_t now_tick = xTaskGetTickCount();
         if ((int32_t)(now_tick - next_refresh_tick) >= 0) {
-            PostNewsText("新聞更新中...", "refresh_start", 0, news_service_count());
+            PostNewsText("新聞更新中...", "refresh_start", 0, NewsTickerSourceCount());
 
             const bool refreshed = periodic_fetch_news();
-            const size_t new_cnt = news_service_count();
-            ESP_LOGI(TAG, "NEWS ticker refresh rss_cnt=%u", (unsigned int)new_cnt);
+            const size_t new_cnt = NewsTickerSourceCount();
+            ESP_LOGI(TAG, "NEWS ticker refresh source_cnt=%u", (unsigned int)new_cnt);
             if (new_cnt > 0) {
                 rotate_idx = 0;
                 PostNewsHeadlineByIndex(rotate_idx, "refresh_apply");
@@ -1368,7 +1402,7 @@ void News_TickerTask(void *arg) {
         }
 
         now_tick = xTaskGetTickCount();
-        const size_t cnt = news_service_count();
+        const size_t cnt = NewsTickerSourceCount();
         if ((cnt > 1) && ((int32_t)(now_tick - next_rotate_tick) >= 0)) {
             rotate_idx = (rotate_idx + 1) % cnt;
             if (PostNewsHeadlineByIndex(rotate_idx, "rotate")) {
