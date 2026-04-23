@@ -23,7 +23,7 @@
 #include "news_service.h"
 #include "weather_service.h"
 #include "lvgl_bsp.h"
-LV_FONT_DECLARE(lv_font_news_tc_16);
+LV_FONT_DECLARE(lv_font_news_tc_28);
 
 static lv_ui init_ui;
 I2cMasterBus I2cbus(14,13,0);
@@ -67,6 +67,9 @@ static const int NEWS_BAR_W = 400;
 static const int NEWS_BAR_H = 40;
 static const int NEWS_BAR_LABEL_X = 6;
 static const int NEWS_BAR_LABEL_W = NEWS_BAR_W - 12;
+// Shift label up so the tall font line_height (54 for 28px Noto TC) doesn't
+// hug the bottom of the 40px bar. -4 leaves ~6px visual gap top and bottom.
+static const int NEWS_BAR_LABEL_Y = -4;
 static const lv_coord_t NEWS_TICKER_GAP_MIN_PX = 18;
 static const lv_coord_t NEWS_TICKER_GAP_MAX_PX = 72;
 static const uint16_t NEWS_LONG_HEADLINE_MARQUEE_SPEED_PX_S = 50;
@@ -185,6 +188,29 @@ static void SetupNewsHeadlineLabelStyle(lv_obj_t *label, const lv_font_t *news_f
     lv_obj_set_style_pad_bottom(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_shadow_width(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 }
+// Boot status is shown in screen_label_1 (400x300, pad_top=12) with a 28px font
+// whose line_height is 54, so only floor((300-12)/54) = 5 lines fit on screen.
+// Trim older lines so the newest status is always visible.
+static const size_t BOOT_STATUS_MAX_VISIBLE_LINES = 5;
+
+static void BootStatusTrimToLastNLines(char *buf, size_t max_lines)
+{
+    if ((buf == NULL) || (max_lines == 0)) {
+        return;
+    }
+    const size_t len = strlen(buf);
+    size_t newlines_seen = 0;
+    for (size_t i = len; i > 0; --i) {
+        if (buf[i - 1] == '\n') {
+            newlines_seen++;
+            if (newlines_seen == max_lines) {
+                memmove(buf, buf + i, (len - i) + 1);
+                return;
+            }
+        }
+    }
+}
+
 static void BootStatusPush(const char *fmt, ...)
 {
     if ((fmt == NULL) || (fmt[0] == '\0')) {
@@ -207,6 +233,7 @@ static void BootStatusPush(const char *fmt, ...)
         }
         strlcat(s_boot_status_text, line, sizeof(s_boot_status_text));
     }
+    BootStatusTrimToLastNLines(s_boot_status_text, BOOT_STATUS_MAX_VISIBLE_LINES);
 
     if (init_ui.screen_label_1 == NULL) {
         return;
@@ -223,7 +250,7 @@ static void BootStatusPush(const char *fmt, ...)
     lv_obj_add_flag(init_ui.screen_label_2, LV_OBJ_FLAG_HIDDEN);
 
     // Use the TC news font for boot status so Traditional Chinese glyphs render correctly.
-    lv_obj_set_style_text_font(init_ui.screen_label_1, &lv_font_news_tc_16, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(init_ui.screen_label_1, &lv_font_news_tc_28, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_align(init_ui.screen_label_1, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_left(init_ui.screen_label_1, 12, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_right(init_ui.screen_label_1, 12, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -685,11 +712,11 @@ static void SetupNewsTickerAnimated(const lv_font_t *news_font)
 
     s_news_marquee_label = lv_label_create(s_news_anim_box);
     SetupNewsHeadlineLabelStyle(s_news_marquee_label, news_font);
-    lv_obj_set_y(s_news_marquee_label, 0);
+    lv_obj_set_y(s_news_marquee_label, NEWS_BAR_LABEL_Y);
 
     s_news_marquee_label_back = lv_label_create(s_news_anim_box);
     SetupNewsHeadlineLabelStyle(s_news_marquee_label_back, news_font);
-    lv_obj_set_y(s_news_marquee_label_back, 0);
+    lv_obj_set_y(s_news_marquee_label_back, NEWS_BAR_LABEL_Y);
     lv_obj_set_x(s_news_marquee_label_back, NEWS_BAR_LABEL_X + NEWS_BAR_LABEL_W + NewsTickerGapPx(NEWS_BAR_LABEL_W));
 
     s_news_ticker_running = false;
@@ -1511,7 +1538,7 @@ void UserApp_UiInit() {
     static const uint32_t date_probe[] = {0x9031, 0x6708, 0x65E5, 0x4E8C}; // 週月日二
     static const uint32_t news_probe[] = {0x65B0, 0x805E, 0x9023, 0x7DB2}; // 新聞連網
     const lv_font_t *date_font = &lv_font_notosans_tc_50;
-    const lv_font_t *news_font = &lv_font_news_tc_16;
+    const lv_font_t *news_font = &lv_font_news_tc_28;
 
     if (!FontHasGlyphs(date_font, date_probe, sizeof(date_probe) / sizeof(date_probe[0]))) {
         ESP_LOGW(TAG, "Date font missing Chinese glyphs, keep lv_font_notosans_tc_50");
@@ -1519,9 +1546,9 @@ void UserApp_UiInit() {
         ESP_LOGI(TAG, "Date font ready: lv_font_notosans_tc_50");
     }
     if (!FontHasGlyphs(news_font, news_probe, sizeof(news_probe) / sizeof(news_probe[0]))) {
-        ESP_LOGW(TAG, "News font missing Chinese glyphs, keep lv_font_news_tc_16");
+        ESP_LOGW(TAG, "News font missing Chinese glyphs, keep lv_font_news_tc_28");
     } else {
-        ESP_LOGI(TAG, "News font ready: lv_font_news_tc_16");
+        ESP_LOGI(TAG, "News font ready: lv_font_news_tc_28");
     }
 
     // Date line under clock.

@@ -605,7 +605,7 @@ void setup_scr_screen(lv_ui *ui)
     lv_obj_set_style_bg_opa(ui->screen_news_label,    255,                      LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(ui->screen_news_label,  lv_color_hex(0xFFFFFF),   LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(ui->screen_news_label,lv_color_hex(0x000000),   LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui->screen_news_label, &lv_font_news_tc_16,      LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui->screen_news_label, &lv_font_news_tc_28,      LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui->screen_news_label,  255,                      LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_align(ui->screen_news_label,LV_TEXT_ALIGN_LEFT,       LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui->screen_news_label, 1,                LV_PART_MAIN | LV_STATE_DEFAULT);

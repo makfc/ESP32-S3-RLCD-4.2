@@ -86,8 +86,8 @@ LV_FONT_DECLARE(lv_font_MISANSMEDIUM_25)
 LV_FONT_DECLARE(lv_font_MISANSMEDIUM_18)
 /* Date-only Traditional Chinese font (50px). */
 LV_FONT_DECLARE(lv_font_notosans_tc_50)
-/* News ticker Traditional Chinese font (16px). */
-LV_FONT_DECLARE(lv_font_news_tc_16)
+/* News ticker Traditional Chinese font (28px). */
+LV_FONT_DECLARE(lv_font_news_tc_28)
 
 
 #ifdef __cplusplus
